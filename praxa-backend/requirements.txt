@@ -1,0 +1,26 @@
+# LiveKit Agents Framework
+livekit>=0.11.0
+livekit-agents>=0.8.0
+livekit-plugins-deepgram>=0.6.0
+livekit-plugins-openai>=0.8.0
+livekit-plugins-elevenlabs>=0.7.0
+livekit-plugins-silero>=0.6.0
+
+# Twilio for phone calls
+twilio>=8.10.0
+
+# Supabase for database
+supabase>=2.0.0
+
+# HTTP server for webhooks/triggers
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# Background tasks
+apscheduler>=3.10.0
+
+# Utilities
+python-dotenv>=1.0.0
+httpx>=0.26.0
+pydantic>=2.5.0
+
