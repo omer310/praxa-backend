@@ -571,7 +571,6 @@ async def entrypoint(ctx: JobContext):
         logger.info("ElevenLabs TTS initialized")
         
         # Create the agent with instructions (v1.0 API)
-        # Agent subclass with instructions as the system prompt
         agent = Agent(instructions=praxa._build_system_prompt())
         logger.info("Agent created with instructions")
         
@@ -584,14 +583,20 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("AgentSession created successfully")
         
-        # Start the session with agent, room, and participant
+        # Start the session - try different parameter combinations
         logger.info(f"Starting session with participant: {participant.identity}")
         
-        await session.start(
-            agent=agent,
-            room=ctx.room,
-            participant=participant,
-        )
+        # v1.0 might use room= only, or room and agent
+        try:
+            await session.start(room=ctx.room, agent=agent)
+        except TypeError as e:
+            logger.info(f"First start attempt failed: {e}, trying without agent")
+            try:
+                await session.start(room=ctx.room)
+            except TypeError as e2:
+                logger.info(f"Second start attempt failed: {e2}, trying with no params")
+                await session.start()
+        
         logger.info("Session started!")
         
         # Say the opening message
