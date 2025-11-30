@@ -574,16 +574,18 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("ElevenLabs TTS initialized")
         
+        # Create chat context with system prompt
+        chat_ctx = llm.ChatContext()
+        chat_ctx.add_message(role="system", content=praxa._build_system_prompt())
+        logger.info("ChatContext created with system prompt")
+        
         # Create a simple session first - just to get it talking
         session = AgentSession(
             vad=vad,
             stt=stt,
             llm=llm_instance,
             tts=tts,
-            chat_ctx=llm.ChatContext().append(
-                role="system",
-                text=praxa._build_system_prompt()
-            ),
+            chat_ctx=chat_ctx,
         )
         logger.info("AgentSession created successfully")
         
