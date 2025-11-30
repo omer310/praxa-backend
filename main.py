@@ -134,7 +134,6 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
             )
             
             # Include phone_number in metadata so agent can dial out
-            import json
             room_metadata = json.dumps({
                 "user_id": user_id,
                 "call_log_id": call_log_id,

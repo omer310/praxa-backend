@@ -404,7 +404,7 @@ async def entrypoint(ctx: JobContext):
     
     This is called by LiveKit when a new room is created for a call.
     The agent will:
-    1. Connect to the room
+    1. Connect to the room first
     2. Read room metadata to get phone number
     3. Dial out via SIP
     4. Wait for phone user to connect
@@ -415,9 +415,17 @@ async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
     logger.info(f"Agent entrypoint called for room: {room_name}")
     
-    # Parse room metadata
+    # Connect to the room FIRST (metadata is available after connection)
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info(f"Agent connected to room: {room_name}")
+    
+    # NOW parse room metadata (available after connection)
     try:
-        metadata = json.loads(ctx.room.metadata) if ctx.room.metadata else {}
+        # Access metadata from the connected room
+        room_metadata = ctx.room.metadata
+        logger.info(f"Room metadata: {room_metadata}")
+        
+        metadata = json.loads(room_metadata) if room_metadata else {}
         user_id = metadata.get("user_id")
         call_log_id = metadata.get("call_log_id")
         phone_number = metadata.get("phone_number")
@@ -434,7 +442,7 @@ async def entrypoint(ctx: JobContext):
             return
             
         if not phone_number:
-            logger.error(f"No phone_number in room metadata: {room_name}")
+            logger.error(f"No phone_number in room metadata: {room_name}, metadata was: {room_metadata}")
             return
             
     except Exception as e:
@@ -447,10 +455,6 @@ async def entrypoint(ctx: JobContext):
     
     # Load user context
     await praxa.load_user_context()
-    
-    # Connect to the room
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    logger.info(f"Agent connected to room: {room_name}")
     
     # Dial out to the phone number via SIP
     participant = None
