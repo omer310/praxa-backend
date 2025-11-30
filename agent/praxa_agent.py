@@ -574,33 +574,23 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("ElevenLabs TTS initialized")
         
-        # Create the agent instance
-        agent = PraxaVoiceAgent()
-        logger.info("PraxaVoiceAgent instance created")
-        
-        # In v1.0, pass agent to AgentSession constructor
+        # Create a simple session first - just to get it talking
         session = AgentSession(
-            agent=agent,
             vad=vad,
             stt=stt,
             llm=llm_instance,
             tts=tts,
+            chat_ctx=llm.ChatContext().append(
+                role="system",
+                text=praxa._build_system_prompt()
+            ),
         )
         logger.info("AgentSession created successfully")
-        
-        # Track transcript via session events
-        @session.on("user_message")
-        def on_user_message(msg):
-            praxa.on_transcript_update("user", msg.content)
-        
-        @session.on("agent_message")
-        def on_agent_message(msg):
-            praxa.on_transcript_update("assistant", msg.content)
         
         # Start the session
         logger.info(f"Starting session with participant: {participant.identity}")
         
-        await session.start(
+        session.start(
             room=ctx.room,
             participant=participant,
         )
