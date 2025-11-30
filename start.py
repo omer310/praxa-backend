@@ -20,8 +20,9 @@ def main():
     ])
     
     # Start LiveKit agent worker
+    # Use the praxa_agent module directly
     agent_process = subprocess.Popen([
-        sys.executable, "-m", "agent.praxa_agent", "dev"
+        sys.executable, "agent/praxa_agent.py", "dev"
     ])
     
     def signal_handler(signum, frame):
@@ -58,4 +59,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

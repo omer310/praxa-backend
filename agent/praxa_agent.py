@@ -10,14 +10,16 @@ import json
 
 from livekit import rtc
 from livekit.agents import (
+    Agent,
+    AgentSession,
     AutoSubscribe,
     JobContext,
     JobProcess,
     WorkerOptions,
     cli,
     llm,
+    RoomInputOptions,
 )
-from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
 from services.supabase_client import get_supabase_client
@@ -119,132 +121,6 @@ class PraxaAgent:
             recently_completed_count=len(self.recently_completed)
         )
 
-    def _create_function_context(self) -> llm.FunctionContext:
-        """Create the function context with available tools for the agent."""
-        fnc_ctx = llm.FunctionContext()
-        
-        @fnc_ctx.ai_callable(
-            description="Mark a task as complete. Use this when the user says they finished a task."
-        )
-        async def mark_task_complete(
-            task_title: str = llm.ai_field(description="The title of the task to mark complete")
-        ):
-            """Mark a task as complete."""
-            try:
-                # Find the task by title
-                task = self._find_task_by_title(task_title)
-                if not task:
-                    return f"I couldn't find a task called '{task_title}'. Could you tell me the exact name?"
-                
-                task_id = task["id"]
-                await self.db.mark_task_complete(task_id)
-                self.tasks_completed.append(task_id)
-                self.tasks_discussed.append(task_id)
-                
-                logger.info(f"Marked task complete: {task_title}")
-                return f"Done! I've marked '{task_title}' as complete."
-            except Exception as e:
-                logger.error(f"Error marking task complete: {e}")
-                return "Sorry, I had trouble updating that task. Let me note it down and we'll fix it."
-
-        @fnc_ctx.ai_callable(
-            description="Add a note to an existing task. Use this to record updates or details about a task."
-        )
-        async def add_task_note(
-            task_title: str = llm.ai_field(description="The title of the task to add a note to"),
-            note: str = llm.ai_field(description="The note to add to the task")
-        ):
-            """Add a note to a task."""
-            try:
-                task = self._find_task_by_title(task_title)
-                if not task:
-                    return f"I couldn't find a task called '{task_title}'."
-                
-                task_id = task["id"]
-                await self.db.add_task_note(task_id, note)
-                self.tasks_discussed.append(task_id)
-                
-                logger.info(f"Added note to task: {task_title}")
-                return f"Got it! I've added that note to '{task_title}'."
-            except Exception as e:
-                logger.error(f"Error adding task note: {e}")
-                return "Sorry, I had trouble adding that note."
-
-        @fnc_ctx.ai_callable(
-            description="Create a new task. Ask the user which bucket/initiative to add it to."
-        )
-        async def create_task(
-            title: str = llm.ai_field(description="The title of the new task"),
-            bucket_name: str = llm.ai_field(description="The name of the bucket/initiative to add the task to"),
-            is_this_week: bool = llm.ai_field(description="Whether to mark this for the current week's focus", default=False)
-        ):
-            """Create a new task."""
-            try:
-                # Find the bucket
-                bucket = await self.db.get_bucket_by_name(self.user_id, bucket_name)
-                if not bucket:
-                    # Get list of available buckets
-                    bucket_names = await self.db.get_user_bucket_names(self.user_id)
-                    return f"I don't see a bucket called '{bucket_name}'. Your buckets are: {', '.join(bucket_names)}. Which one should I use?"
-                
-                new_task = await self.db.create_task(
-                    user_id=self.user_id,
-                    bucket_id=bucket["id"],
-                    title=title,
-                    is_this_week=is_this_week
-                )
-                
-                if new_task:
-                    self.tasks_created.append(new_task["id"])
-                    logger.info(f"Created new task: {title} in {bucket_name}")
-                    week_note = " and marked it for this week" if is_this_week else ""
-                    return f"Done! I've added '{title}' to your {bucket_name} bucket{week_note}."
-                else:
-                    return "Sorry, I had trouble creating that task."
-            except Exception as e:
-                logger.error(f"Error creating task: {e}")
-                return "Sorry, something went wrong creating that task."
-
-        @fnc_ctx.ai_callable(
-            description="Update the due date of a task. Use when user wants to reschedule."
-        )
-        async def update_task_due_date(
-            task_title: str = llm.ai_field(description="The title of the task to update"),
-            due_date: str = llm.ai_field(description="The new due date in YYYY-MM-DD format")
-        ):
-            """Update a task's due date."""
-            try:
-                task = self._find_task_by_title(task_title)
-                if not task:
-                    return f"I couldn't find a task called '{task_title}'."
-                
-                task_id = task["id"]
-                await self.db.update_task_due_date(task_id, due_date)
-                self.tasks_discussed.append(task_id)
-                
-                logger.info(f"Updated due date for task: {task_title} to {due_date}")
-                return f"Updated! '{task_title}' is now due on {due_date}."
-            except Exception as e:
-                logger.error(f"Error updating due date: {e}")
-                return "Sorry, I had trouble updating that due date."
-
-        @fnc_ctx.ai_callable(
-            description="Get the list of user's buckets/initiatives. Use when you need to know what buckets exist."
-        )
-        async def list_buckets():
-            """List the user's buckets."""
-            try:
-                bucket_names = await self.db.get_user_bucket_names(self.user_id)
-                if bucket_names:
-                    return f"Your buckets are: {', '.join(bucket_names)}"
-                else:
-                    return "You don't have any buckets set up yet."
-            except Exception as e:
-                logger.error(f"Error listing buckets: {e}")
-                return "Sorry, I had trouble getting your buckets."
-
-        return fnc_ctx
-
     def _find_task_by_title(self, title: str) -> Optional[dict]:
         """Find a task by title (fuzzy match)."""
         title_lower = title.lower().strip()
@@ -267,7 +143,7 @@ class PraxaAgent:
         
         return None
 
-    async def _on_call_started(self):
+    async def on_call_started(self):
         """Called when the call is connected."""
         self.call_started_at = datetime.utcnow()
         
@@ -279,7 +155,7 @@ class PraxaAgent:
         
         logger.info(f"Call started for user {self.user_id}")
 
-    async def _on_call_ended(self):
+    async def on_call_ended(self):
         """Called when the call ends."""
         try:
             ended_at = datetime.utcnow()
@@ -331,8 +207,6 @@ class PraxaAgent:
                 for msg in self.transcript
             ])
             
-            client = openai.LLM()
-            
             summary_prompt = f"""Summarize this productivity check-in call in 2-3 sentences. 
 Focus on: what was discussed, tasks completed, and any new commitments made.
 
@@ -355,13 +229,165 @@ Transcript:
             logger.error(f"Error generating summary: {e}")
             return f"Call completed. {len(self.tasks_completed)} tasks marked done, {len(self.tasks_created)} tasks created."
 
-    def _on_transcript_update(self, role: str, content: str):
+    def on_transcript_update(self, role: str, content: str):
         """Called when there's new transcript content."""
         self.transcript.append({
             "role": role,
             "content": content,
             "timestamp": datetime.utcnow().isoformat()
         })
+
+    # Tool functions for the agent
+    async def mark_task_complete(self, task_title: str) -> str:
+        """Mark a task as complete."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'. Could you tell me the exact name?"
+            
+            task_id = task["id"]
+            await self.db.mark_task_complete(task_id)
+            self.tasks_completed.append(task_id)
+            self.tasks_discussed.append(task_id)
+            
+            logger.info(f"Marked task complete: {task_title}")
+            return f"Done! I've marked '{task_title}' as complete."
+        except Exception as e:
+            logger.error(f"Error marking task complete: {e}")
+            return "Sorry, I had trouble updating that task. Let me note it down and we'll fix it."
+
+    async def add_task_note(self, task_title: str, note: str) -> str:
+        """Add a note to a task."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+            
+            task_id = task["id"]
+            await self.db.add_task_note(task_id, note)
+            self.tasks_discussed.append(task_id)
+            
+            logger.info(f"Added note to task: {task_title}")
+            return f"Got it! I've added that note to '{task_title}'."
+        except Exception as e:
+            logger.error(f"Error adding task note: {e}")
+            return "Sorry, I had trouble adding that note."
+
+    async def create_task(self, title: str, bucket_name: str, is_this_week: bool = False) -> str:
+        """Create a new task."""
+        try:
+            bucket = await self.db.get_bucket_by_name(self.user_id, bucket_name)
+            if not bucket:
+                bucket_names = await self.db.get_user_bucket_names(self.user_id)
+                return f"I don't see a bucket called '{bucket_name}'. Your buckets are: {', '.join(bucket_names)}. Which one should I use?"
+            
+            new_task = await self.db.create_task(
+                user_id=self.user_id,
+                bucket_id=bucket["id"],
+                title=title,
+                is_this_week=is_this_week
+            )
+            
+            if new_task:
+                self.tasks_created.append(new_task["id"])
+                logger.info(f"Created new task: {title} in {bucket_name}")
+                week_note = " and marked it for this week" if is_this_week else ""
+                return f"Done! I've added '{title}' to your {bucket_name} bucket{week_note}."
+            else:
+                return "Sorry, I had trouble creating that task."
+        except Exception as e:
+            logger.error(f"Error creating task: {e}")
+            return "Sorry, something went wrong creating that task."
+
+    async def update_task_due_date(self, task_title: str, due_date: str) -> str:
+        """Update a task's due date."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+            
+            task_id = task["id"]
+            await self.db.update_task_due_date(task_id, due_date)
+            self.tasks_discussed.append(task_id)
+            
+            logger.info(f"Updated due date for task: {task_title} to {due_date}")
+            return f"Updated! '{task_title}' is now due on {due_date}."
+        except Exception as e:
+            logger.error(f"Error updating due date: {e}")
+            return "Sorry, I had trouble updating that due date."
+
+    async def list_buckets(self) -> str:
+        """List the user's buckets."""
+        try:
+            bucket_names = await self.db.get_user_bucket_names(self.user_id)
+            if bucket_names:
+                return f"Your buckets are: {', '.join(bucket_names)}"
+            else:
+                return "You don't have any buckets set up yet."
+        except Exception as e:
+            logger.error(f"Error listing buckets: {e}")
+            return "Sorry, I had trouble getting your buckets."
+
+
+# Global agent instance for the current session
+_current_agent: Optional[PraxaAgent] = None
+
+
+def create_praxa_agent_class(praxa: PraxaAgent):
+    """Create a custom Agent class with the Praxa tools."""
+    
+    class PraxaVoiceAgent(Agent):
+        def __init__(self):
+            super().__init__(
+                instructions=praxa._build_system_prompt(),
+            )
+        
+        @llm.function_tool
+        async def mark_task_complete(self, task_title: str) -> str:
+            """Mark a task as complete. Use this when the user says they finished a task.
+            
+            Args:
+                task_title: The title of the task to mark complete
+            """
+            return await praxa.mark_task_complete(task_title)
+        
+        @llm.function_tool
+        async def add_task_note(self, task_title: str, note: str) -> str:
+            """Add a note to an existing task. Use this to record updates or details about a task.
+            
+            Args:
+                task_title: The title of the task to add a note to
+                note: The note to add to the task
+            """
+            return await praxa.add_task_note(task_title, note)
+        
+        @llm.function_tool
+        async def create_task(self, title: str, bucket_name: str, is_this_week: bool = False) -> str:
+            """Create a new task. Ask the user which bucket/initiative to add it to.
+            
+            Args:
+                title: The title of the new task
+                bucket_name: The name of the bucket/initiative to add the task to
+                is_this_week: Whether to mark this for the current week's focus
+            """
+            return await praxa.create_task(title, bucket_name, is_this_week)
+        
+        @llm.function_tool
+        async def update_task_due_date(self, task_title: str, due_date: str) -> str:
+            """Update the due date of a task. Use when user wants to reschedule.
+            
+            Args:
+                task_title: The title of the task to update
+                due_date: The new due date in YYYY-MM-DD format
+            """
+            return await praxa.update_task_due_date(task_title, due_date)
+        
+        @llm.function_tool
+        async def list_buckets(self) -> str:
+            """Get the list of user's buckets/initiatives. Use when you need to know what buckets exist."""
+            return await praxa.list_buckets()
+    
+    return PraxaVoiceAgent
 
 
 async def entrypoint(ctx: JobContext):
@@ -371,13 +397,13 @@ async def entrypoint(ctx: JobContext):
     This is called by LiveKit when a new room is created for a call.
     The room name should contain the call information.
     """
-    # Extract user_id and call_log_id from room metadata or job attributes
-    # Room name format: praxa-call-{user_id}-{call_log_id}
-    room_name = ctx.room.name
+    global _current_agent
     
+    room_name = ctx.room.name
     logger.info(f"Agent entrypoint called for room: {room_name}")
     
     # Parse room name to get IDs
+    # Room name format: praxa-call-{user_id}-{call_log_id}
     try:
         parts = room_name.split("-")
         if len(parts) >= 4 and parts[0] == "praxa" and parts[1] == "call":
@@ -385,8 +411,9 @@ async def entrypoint(ctx: JobContext):
             call_log_id = parts[3]
         else:
             # Try to get from job metadata
-            user_id = ctx.job.metadata.get("user_id") if ctx.job.metadata else None
-            call_log_id = ctx.job.metadata.get("call_log_id") if ctx.job.metadata else None
+            metadata = json.loads(ctx.room.metadata) if ctx.room.metadata else {}
+            user_id = metadata.get("user_id")
+            call_log_id = metadata.get("call_log_id")
             
             if not user_id or not call_log_id:
                 logger.error(f"Could not parse room name: {room_name}")
@@ -395,65 +422,62 @@ async def entrypoint(ctx: JobContext):
         logger.error(f"Error parsing room name: {e}")
         return
     
-    # Create the agent
-    agent = PraxaAgent(user_id=user_id, call_log_id=call_log_id)
+    # Create the Praxa agent instance
+    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id)
+    _current_agent = praxa
     
     # Load user context
-    await agent.load_user_context()
+    await praxa.load_user_context()
     
     # Connect to the room
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
     # Wait for a participant (the phone caller)
     participant = await ctx.wait_for_participant()
-    
     logger.info(f"Participant connected: {participant.identity}")
     
     # Mark call as started
-    await agent._on_call_started()
+    await praxa.on_call_started()
     
-    # Create the voice pipeline
-    initial_ctx = llm.ChatContext().append(
-        role="system",
-        text=agent._build_system_prompt()
-    )
+    # Create the agent class with tools
+    PraxaVoiceAgent = create_praxa_agent_class(praxa)
     
-    # Initialize STT, LLM, TTS
-    voice_agent = VoicePipelineAgent(
+    # Create the agent session
+    session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(),
         llm=openai.LLM(model="gpt-4o"),
         tts=elevenlabs.TTS(
             voice_id=os.getenv("ELEVEN_LABS_VOICE_ID", "Pcfg2Zc6kmNWQ9ji3J5F"),
-            model_id="eleven_turbo_v2"
+            model="eleven_turbo_v2"
         ),
-        chat_ctx=initial_ctx,
-        fnc_ctx=agent._create_function_context()
     )
     
-    # Track transcript
-    @voice_agent.on("user_speech_committed")
-    def on_user_speech(msg):
-        agent._on_transcript_update("user", msg.content)
+    # Track transcript via session events
+    @session.on("user_message")
+    def on_user_message(msg):
+        praxa.on_transcript_update("user", msg.content)
     
-    @voice_agent.on("agent_speech_committed")
-    def on_agent_speech(msg):
-        agent._on_transcript_update("assistant", msg.content)
+    @session.on("agent_message")
+    def on_agent_message(msg):
+        praxa.on_transcript_update("assistant", msg.content)
     
-    # Start the agent
-    voice_agent.start(ctx.room, participant)
+    # Start the session with the agent
+    agent = PraxaVoiceAgent()
+    session.start(
+        room=ctx.room,
+        participant=participant,
+        agent=agent,
+    )
     
     # Say the opening message
-    await voice_agent.say(agent._get_opening_message(), allow_interruptions=True)
+    await session.say(praxa._get_opening_message(), allow_interruptions=True)
     
-    # Wait for the call to end (participant disconnect)
-    try:
-        await participant.disconnected
-    except Exception as e:
-        logger.info(f"Participant disconnected: {e}")
+    # Wait for the session to end
+    await session.wait()
     
     # Handle call end
-    await agent._on_call_ended()
+    await praxa.on_call_ended()
 
 
 def prequit(proc: JobProcess):
@@ -473,4 +497,3 @@ def run_agent():
 
 if __name__ == "__main__":
     run_agent()
-
