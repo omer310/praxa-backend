@@ -27,24 +27,12 @@ class SupabaseClient:
 
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
-        Fetch user settings directly by user_id.
-        
-        For MVP without auth, we query user_settings directly.
-        The user_id in user_settings IS the user identifier.
-        
-        Args:
-            user_id: The UUID of the user (matches user_id in user_settings)
-            
-        Returns:
-            Dict with user and settings data, or None if not found
+        Fetch user settings directly by ID.
+        For MVP without auth, we query user_settings by id (not user_id).
         """
         try:
-            # Query user_settings directly - no users table needed for MVP
-            settings_response = self.client.table("user_settings").select("*").eq("user_id", user_id).single().execute()
-            
-            if not settings_response.data:
-                # Try querying by id if user_id doesn't match
-                settings_response = self.client.table("user_settings").select("*").eq("id", user_id).single().execute()
+            # For MVP: Query by the 'id' column directly (since user_id is NULL)
+            settings_response = self.client.table("user_settings").select("*").eq("id", user_id).single().execute()
             
             if not settings_response.data:
                 logger.warning(f"User settings not found for: {user_id}")
@@ -55,9 +43,9 @@ class SupabaseClient:
             # Create a synthetic user object from settings for compatibility
             return {
                 "user": {
-                    "id": settings.get("user_id") or settings.get("id"),
-                    "email": settings.get("email", ""),
-                    "name": settings.get("name", ""),
+                    "id": settings.get("id"),
+                    "email": "",
+                    "name": "",
                 },
                 "settings": settings
             }
