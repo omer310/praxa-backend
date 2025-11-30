@@ -18,11 +18,9 @@ from livekit.agents import (
     AgentSession,
     AutoSubscribe,
     JobContext,
-    JobProcess,
     WorkerOptions,
     cli,
     llm,
-    RoomInputOptions,
 )
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
@@ -484,17 +482,11 @@ async def entrypoint(ctx: JobContext):
     await praxa.on_call_ended()
 
 
-def prequit(proc: JobProcess):
-    """Called before the worker process exits."""
-    logger.info("Agent worker shutting down")
-
-
 def run_agent():
     """Run the LiveKit agent worker."""
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prequit_fnc=prequit,
         )
     )
 
