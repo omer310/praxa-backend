@@ -44,6 +44,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     llm,
+    function_tool,
 )
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
@@ -373,7 +374,7 @@ def create_praxa_agent_class(praxa: PraxaAgent):
                 instructions=praxa._build_system_prompt(),
             )
         
-        @llm.function_tool
+        @function_tool
         async def mark_task_complete(self, task_title: str) -> str:
             """Mark a task as complete. Use this when the user says they finished a task.
             
@@ -382,7 +383,7 @@ def create_praxa_agent_class(praxa: PraxaAgent):
             """
             return await praxa.mark_task_complete(task_title)
         
-        @llm.function_tool
+        @function_tool
         async def add_task_note(self, task_title: str, note: str) -> str:
             """Add a note to an existing task. Use this to record updates or details about a task.
             
@@ -392,7 +393,7 @@ def create_praxa_agent_class(praxa: PraxaAgent):
             """
             return await praxa.add_task_note(task_title, note)
         
-        @llm.function_tool
+        @function_tool
         async def create_task(self, title: str, bucket_name: str, is_this_week: bool = False) -> str:
             """Create a new task. Ask the user which bucket/initiative to add it to.
             
@@ -403,7 +404,7 @@ def create_praxa_agent_class(praxa: PraxaAgent):
             """
             return await praxa.create_task(title, bucket_name, is_this_week)
         
-        @llm.function_tool
+        @function_tool
         async def update_task_due_date(self, task_title: str, due_date: str) -> str:
             """Update the due date of a task. Use when user wants to reschedule.
             
@@ -413,7 +414,7 @@ def create_praxa_agent_class(praxa: PraxaAgent):
             """
             return await praxa.update_task_due_date(task_title, due_date)
         
-        @llm.function_tool
+        @function_tool
         async def list_buckets(self) -> str:
             """Get the list of user's buckets/initiatives. Use when you need to know what buckets exist."""
             return await praxa.list_buckets()
@@ -570,9 +571,10 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("ElevenLabs TTS initialized")
         
-        # Create the agent with instructions (v1.0 API)
-        agent = Agent(instructions=praxa._build_system_prompt())
-        logger.info("Agent created with instructions")
+        # Create the Praxa agent with function tools for task management
+        PraxaVoiceAgent = create_praxa_agent_class(praxa)
+        agent = PraxaVoiceAgent()
+        logger.info("PraxaVoiceAgent created with function tools")
         
         # Create AgentSession with pipeline components
         session = AgentSession(
@@ -583,10 +585,21 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("AgentSession created successfully")
         
-        # Start the session - try different parameter combinations
+        # Track transcripts using session events
+        @session.on("user_speech_committed")
+        def on_user_speech(msg):
+            praxa.on_transcript_update("user", msg.content if hasattr(msg, 'content') else str(msg))
+            logger.info(f"User said: {msg}")
+        
+        @session.on("agent_speech_committed") 
+        def on_agent_speech(msg):
+            praxa.on_transcript_update("assistant", msg.content if hasattr(msg, 'content') else str(msg))
+            logger.info(f"Agent said: {msg}")
+        
+        # Start the session
         logger.info(f"Starting session with participant: {participant.identity}")
         
-        # v1.0 might use room= only, or room and agent
+        # v1.0 uses room= and agent=
         try:
             await session.start(room=ctx.room, agent=agent)
         except TypeError as e:
@@ -608,14 +621,18 @@ async def entrypoint(ctx: JobContext):
         # Wait for the session to end
         logger.info("Waiting for session to end...")
         await session.wait()
-        logger.info("Session ended")
+        logger.info("Session ended normally")
         
     except Exception as e:
         logger.error(f"Error in agent session: {e}", exc_info=True)
-        raise
-    
-    # Handle call end
-    await praxa.on_call_ended()
+    finally:
+        # ALWAYS call on_call_ended, even if there was an error
+        logger.info("Calling on_call_ended...")
+        try:
+            await praxa.on_call_ended()
+            logger.info("on_call_ended completed successfully")
+        except Exception as e:
+            logger.error(f"Error in on_call_ended: {e}")
 
 
 def run_agent():
