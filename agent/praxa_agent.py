@@ -552,11 +552,7 @@ async def entrypoint(ctx: JobContext):
     logger.info("Call marked as started, creating agent session...")
     
     try:
-        # Create the agent class with tools
-        PraxaVoiceAgent = create_praxa_agent_class(praxa)
-        logger.info("Created PraxaVoiceAgent class")
-        
-        # Create the agent session
+        # Initialize voice pipeline components
         logger.info("Initializing voice pipeline components...")
         
         vad = silero.VAD.load()
@@ -574,25 +570,25 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("ElevenLabs TTS initialized")
         
-        # Create chat context with system prompt
-        chat_ctx = llm.ChatContext()
-        chat_ctx.add_message(role="system", content=praxa._build_system_prompt())
-        logger.info("ChatContext created with system prompt")
+        # Create the agent with instructions (v1.0 API)
+        # Agent subclass with instructions as the system prompt
+        agent = Agent(instructions=praxa._build_system_prompt())
+        logger.info("Agent created with instructions")
         
-        # Create a simple session first - just to get it talking
+        # Create AgentSession with pipeline components
         session = AgentSession(
             vad=vad,
             stt=stt,
             llm=llm_instance,
             tts=tts,
-            chat_ctx=chat_ctx,
         )
         logger.info("AgentSession created successfully")
         
-        # Start the session
+        # Start the session with agent, room, and participant
         logger.info(f"Starting session with participant: {participant.identity}")
         
-        session.start(
+        await session.start(
+            agent=agent,
             room=ctx.room,
             participant=participant,
         )
