@@ -9,6 +9,15 @@ from typing import Optional
 from uuid import UUID
 import json
 
+# Reduce logging noise from third-party libraries to avoid Railway rate limits
+logging.getLogger("livekit").setLevel(logging.WARNING)
+logging.getLogger("livekit.agents").setLevel(logging.WARNING)
+logging.getLogger("livekit.rtc").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("deepgram").setLevel(logging.WARNING)
+
 # Ensure the parent directory is in the path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -412,17 +421,27 @@ async def entrypoint(ctx: JobContext):
     """
     global _current_agent
     
+    # Use print for debugging (bypasses log rate limits)
+    import sys
+    print("=" * 50, flush=True)
+    print("AGENT ENTRYPOINT CALLED", flush=True)
+    print("=" * 50, flush=True)
+    
     room_name = ctx.room.name
+    print(f"Room name: {room_name}", flush=True)
     logger.info(f"Agent entrypoint called for room: {room_name}")
     
     # Connect to the room FIRST (metadata is available after connection)
+    print("Connecting to room...", flush=True)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    print(f"Connected to room: {room_name}", flush=True)
     logger.info(f"Agent connected to room: {room_name}")
     
     # NOW parse room metadata (available after connection)
     try:
         # Access metadata from the connected room
         room_metadata = ctx.room.metadata
+        print(f"Room metadata: {room_metadata}", flush=True)
         logger.info(f"Room metadata: {room_metadata}")
         
         metadata = json.loads(room_metadata) if room_metadata else {}
@@ -459,11 +478,15 @@ async def entrypoint(ctx: JobContext):
     # Dial out to the phone number via SIP
     participant = None
     try:
+        print(f"LIVEKIT_SIP_TRUNK_ID = {LIVEKIT_SIP_TRUNK_ID}", flush=True)
+        
         if not LIVEKIT_SIP_TRUNK_ID:
+            print("ERROR: LIVEKIT_SIP_TRUNK_ID not configured!", flush=True)
             logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
             logger.error("Please configure a SIP trunk in LiveKit Cloud: https://cloud.livekit.io")
             return
         
+        print(f"Dialing out to {phone_number} via SIP...", flush=True)
         logger.info(f"Dialing out to {phone_number} via SIP...")
         
         lk_api = livekit_api.LiveKitAPI(
@@ -496,7 +519,9 @@ async def entrypoint(ctx: JobContext):
             })
         
         # Wait for the phone participant to connect
+        print("Waiting for phone participant to connect...", flush=True)
         participant = await ctx.wait_for_participant()
+        print(f"Phone participant connected: {participant.identity}", flush=True)
         logger.info(f"Phone participant connected: {participant.identity}")
         
     except Exception as e:
