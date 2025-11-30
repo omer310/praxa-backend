@@ -52,7 +52,7 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 
 
-async def trigger_call_for_user(user_id: str) -> Optional[str]:
+async def trigger_call_for_user(user_id: str) -> Optional[dict]:
     """
     Trigger a call for a specific user.
     
@@ -67,7 +67,7 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
         user_id: The UUID of the user to call
         
     Returns:
-        The call_log_id if successful, None if failed
+        Dict with call_log_id and room_name if successful, None if failed
     """
     db = get_supabase_client()
     
@@ -158,7 +158,7 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
                 "status": "initiated"
             })
             
-            return call_log_id
+            return {"call_log_id": call_log_id, "room_name": room_name}
             
         except Exception as e:
             logger.error(f"Failed to create LiveKit room: {e}")
@@ -275,20 +275,16 @@ async def trigger_call(
         raise HTTPException(status_code=400, detail="User has no phone number configured")
     
     # Trigger the call
-    call_log_id = await trigger_call_for_user(user_id)
+    result = await trigger_call_for_user(user_id)
     
-    if not call_log_id:
+    if not result:
         raise HTTPException(status_code=500, detail="Failed to initiate call")
-    
-    # Get room name from call log
-    call_log = await db.get_call_log_by_room(f"praxa-call-{user_id}-") or {}
-    room_name = call_log.get("livekit_room_name")
     
     return TriggerCallResponse(
         success=True,
         message="Call initiated successfully",
-        call_log_id=UUID(call_log_id),
-        livekit_room_name=room_name
+        call_log_id=UUID(result["call_log_id"]),
+        livekit_room_name=result["room_name"]
     )
 
 
