@@ -10,13 +10,27 @@ from uuid import UUID
 import json
 
 # Reduce logging noise from third-party libraries to avoid Railway rate limits
-logging.getLogger("livekit").setLevel(logging.WARNING)
-logging.getLogger("livekit.agents").setLevel(logging.WARNING)
-logging.getLogger("livekit.rtc").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("deepgram").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.ERROR)
+logging.getLogger("livekit.agents").setLevel(logging.ERROR)
+logging.getLogger("livekit.rtc").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("openai").setLevel(logging.ERROR)
+logging.getLogger("deepgram").setLevel(logging.ERROR)
+logging.getLogger("hpack").setLevel(logging.ERROR)
+logging.getLogger("hpack.hpack").setLevel(logging.ERROR)
+logging.getLogger("hpack.table").setLevel(logging.ERROR)
+logging.getLogger("h2").setLevel(logging.ERROR)
+logging.getLogger("h11").setLevel(logging.ERROR)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("websockets").setLevel(logging.ERROR)
+logging.getLogger("aiohttp").setLevel(logging.ERROR)
+
+# Silence ALL debug logging except our own
+for name in logging.root.manager.loggerDict:
+    if not name.startswith("__main__") and not name.startswith("services") and not name.startswith("agent"):
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 # Ensure the parent directory is in the path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
