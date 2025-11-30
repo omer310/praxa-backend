@@ -510,43 +510,72 @@ async def entrypoint(ctx: JobContext):
     
     # Mark call as started
     await praxa.on_call_started()
+    logger.info("Call marked as started, creating agent session...")
     
-    # Create the agent class with tools
-    PraxaVoiceAgent = create_praxa_agent_class(praxa)
-    
-    # Create the agent session
-    session = AgentSession(
-        vad=silero.VAD.load(),
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o"),
-        tts=elevenlabs.TTS(
+    try:
+        # Create the agent class with tools
+        PraxaVoiceAgent = create_praxa_agent_class(praxa)
+        logger.info("Created PraxaVoiceAgent class")
+        
+        # Create the agent session
+        logger.info("Initializing voice pipeline components...")
+        
+        vad = silero.VAD.load()
+        logger.info("VAD loaded")
+        
+        stt = deepgram.STT()
+        logger.info("Deepgram STT initialized")
+        
+        llm_instance = openai.LLM(model="gpt-4o")
+        logger.info("OpenAI LLM initialized")
+        
+        tts = elevenlabs.TTS(
             voice_id=os.getenv("ELEVEN_LABS_VOICE_ID", "Pcfg2Zc6kmNWQ9ji3J5F"),
-            model="eleven_turbo_v2"
-        ),
-    )
-    
-    # Track transcript via session events
-    @session.on("user_message")
-    def on_user_message(msg):
-        praxa.on_transcript_update("user", msg.content)
-    
-    @session.on("agent_message")
-    def on_agent_message(msg):
-        praxa.on_transcript_update("assistant", msg.content)
-    
-    # Start the session with the agent
-    agent = PraxaVoiceAgent()
-    session.start(
-        room=ctx.room,
-        participant=participant,
-        agent=agent,
-    )
-    
-    # Say the opening message
-    await session.say(praxa._get_opening_message(), allow_interruptions=True)
-    
-    # Wait for the session to end
-    await session.wait()
+        )
+        logger.info("ElevenLabs TTS initialized")
+        
+        session = AgentSession(
+            vad=vad,
+            stt=stt,
+            llm=llm_instance,
+            tts=tts,
+        )
+        logger.info("AgentSession created successfully")
+        
+        # Track transcript via session events
+        @session.on("user_message")
+        def on_user_message(msg):
+            praxa.on_transcript_update("user", msg.content)
+        
+        @session.on("agent_message")
+        def on_agent_message(msg):
+            praxa.on_transcript_update("assistant", msg.content)
+        
+        # Start the session with the agent
+        agent = PraxaVoiceAgent()
+        logger.info(f"Starting session with participant: {participant.identity}")
+        
+        session.start(
+            room=ctx.room,
+            participant=participant,
+            agent=agent,
+        )
+        logger.info("Session started!")
+        
+        # Say the opening message
+        opening_msg = praxa._get_opening_message()
+        logger.info(f"Saying opening message: {opening_msg[:50]}...")
+        await session.say(opening_msg, allow_interruptions=True)
+        logger.info("Opening message sent!")
+        
+        # Wait for the session to end
+        logger.info("Waiting for session to end...")
+        await session.wait()
+        logger.info("Session ended")
+        
+    except Exception as e:
+        logger.error(f"Error in agent session: {e}", exc_info=True)
+        raise
     
     # Handle call end
     await praxa.on_call_ended()
