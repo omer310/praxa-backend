@@ -12,7 +12,7 @@ import json
 # Ensure the parent directory is in the path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from livekit import rtc
+from livekit import rtc, api as livekit_api
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -23,6 +23,12 @@ from livekit.agents import (
     llm,
 )
 from livekit.plugins import deepgram, elevenlabs, openai, silero
+
+# LiveKit SIP configuration
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
 
 from services.supabase_client import get_supabase_client
 from agent.prompts import SYSTEM_PROMPT, get_user_context_prompt, get_opening_message, get_closing_message
@@ -397,35 +403,46 @@ async def entrypoint(ctx: JobContext):
     Main entry point for the LiveKit agent.
     
     This is called by LiveKit when a new room is created for a call.
-    The room name should contain the call information.
+    The agent will:
+    1. Connect to the room
+    2. Read room metadata to get phone number
+    3. Dial out via SIP
+    4. Wait for phone user to connect
+    5. Start the conversation
     """
     global _current_agent
     
     room_name = ctx.room.name
     logger.info(f"Agent entrypoint called for room: {room_name}")
     
-    # Parse room name to get IDs
-    # Room name format: praxa-call-{user_id}-{call_log_id}
+    # Parse room metadata
     try:
-        parts = room_name.split("-")
-        if len(parts) >= 4 and parts[0] == "praxa" and parts[1] == "call":
-            user_id = parts[2]
-            call_log_id = parts[3]
-        else:
-            # Try to get from job metadata
-            metadata = json.loads(ctx.room.metadata) if ctx.room.metadata else {}
-            user_id = metadata.get("user_id")
-            call_log_id = metadata.get("call_log_id")
+        metadata = json.loads(ctx.room.metadata) if ctx.room.metadata else {}
+        user_id = metadata.get("user_id")
+        call_log_id = metadata.get("call_log_id")
+        phone_number = metadata.get("phone_number")
+        
+        # Fallback to parsing room name if metadata is missing
+        if not user_id:
+            parts = room_name.split("-")
+            if len(parts) >= 4 and parts[0] == "praxa" and parts[1] == "call":
+                user_id = parts[2]
+                call_log_id = parts[3] if len(parts) > 3 else None
+        
+        if not user_id:
+            logger.error(f"Could not get user_id from room: {room_name}")
+            return
             
-            if not user_id or not call_log_id:
-                logger.error(f"Could not parse room name: {room_name}")
-                return
+        if not phone_number:
+            logger.error(f"No phone_number in room metadata: {room_name}")
+            return
+            
     except Exception as e:
-        logger.error(f"Error parsing room name: {e}")
+        logger.error(f"Error parsing room metadata: {e}")
         return
     
     # Create the Praxa agent instance
-    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id)
+    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id or "unknown")
     _current_agent = praxa
     
     # Load user context
@@ -433,10 +450,59 @@ async def entrypoint(ctx: JobContext):
     
     # Connect to the room
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info(f"Agent connected to room: {room_name}")
     
-    # Wait for a participant (the phone caller)
-    participant = await ctx.wait_for_participant()
-    logger.info(f"Participant connected: {participant.identity}")
+    # Dial out to the phone number via SIP
+    participant = None
+    try:
+        if not LIVEKIT_SIP_TRUNK_ID:
+            logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
+            logger.error("Please configure a SIP trunk in LiveKit Cloud: https://cloud.livekit.io")
+            return
+        
+        logger.info(f"Dialing out to {phone_number} via SIP...")
+        
+        lk_api = livekit_api.LiveKitAPI(
+            LIVEKIT_URL,
+            LIVEKIT_API_KEY,
+            LIVEKIT_API_SECRET
+        )
+        
+        # Create SIP participant (dial out)
+        sip_response = await lk_api.sip.create_sip_participant(
+            livekit_api.CreateSIPParticipantRequest(
+                sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
+                sip_call_to=phone_number,
+                room_name=room_name,
+                participant_identity="phone-user",
+                participant_name="Phone User",
+                play_ringtone=True,
+            )
+        )
+        
+        await lk_api.aclose()
+        
+        logger.info(f"SIP call initiated to {phone_number}")
+        
+        # Update call log
+        if call_log_id:
+            await praxa.db.update_call_log(call_log_id, {
+                "status": "ringing",
+                "call_sid": sip_response.sip_call_id if sip_response else None
+            })
+        
+        # Wait for the phone participant to connect
+        participant = await ctx.wait_for_participant()
+        logger.info(f"Phone participant connected: {participant.identity}")
+        
+    except Exception as e:
+        logger.error(f"Failed to dial out via SIP: {e}")
+        if call_log_id:
+            await praxa.db.update_call_log(call_log_id, {
+                "status": "failed",
+                "failure_reason": f"SIP dial failed: {str(e)}"
+            })
+        return
     
     # Mark call as started
     await praxa.on_call_started()

@@ -8,6 +8,7 @@ and manages the background scheduler for automated calls.
 
 import os
 import asyncio
+import json
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -28,7 +29,6 @@ from models.schemas import (
     CallStatus,
 )
 from services.supabase_client import get_supabase_client, SupabaseClient
-from services.twilio_service import get_twilio_service, TwilioService
 from services.scheduler import get_call_scheduler, CallScheduler
 
 # Load environment variables
@@ -58,9 +58,10 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
     
     This function:
     1. Fetches user data from Supabase
-    2. Creates a LiveKit room for the call
-    3. Creates a call log entry
-    4. Initiates the phone call via Twilio
+    2. Creates a call log entry
+    3. Creates a LiveKit room with phone number in metadata
+    4. LiveKit dispatches the agent to the room
+    5. The agent dials out via SIP after joining
     
     Args:
         user_id: The UUID of the user to call
@@ -69,7 +70,6 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
         The call_log_id if successful, None if failed
     """
     db = get_supabase_client()
-    twilio = get_twilio_service()
     
     try:
         # Get user with settings
@@ -124,7 +124,8 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
         
         call_log_id = call_log["id"]
         
-        # Create LiveKit room
+        # Create LiveKit room with phone number in metadata
+        # The agent will be dispatched to this room and will dial out via SIP
         try:
             lk_api = livekit_api.LiveKitAPI(
                 LIVEKIT_URL,
@@ -132,45 +133,36 @@ async def trigger_call_for_user(user_id: str) -> Optional[str]:
                 LIVEKIT_API_SECRET
             )
             
+            # Include phone_number in metadata so agent can dial out
+            import json
+            room_metadata = json.dumps({
+                "user_id": user_id,
+                "call_log_id": call_log_id,
+                "phone_number": phone_number,
+            })
+            
             await lk_api.room.create_room(
                 livekit_api.CreateRoomRequest(
                     name=room_name,
                     empty_timeout=300,  # 5 minutes
-                    max_participants=2,
-                    metadata=f'{{"user_id": "{user_id}", "call_log_id": "{call_log_id}"}}'
+                    max_participants=3,  # agent + phone user + buffer
+                    metadata=room_metadata
                 )
             )
             
-            logger.info(f"Created LiveKit room: {room_name}")
+            await lk_api.aclose()
             
-        except Exception as e:
-            logger.error(f"Failed to create LiveKit room: {e}")
-            await db.update_call_log(call_log_id, {
-                "status": "failed",
-                "failure_reason": f"Failed to create LiveKit room: {str(e)}"
-            })
-            return None
-        
-        # Initiate Twilio call
-        try:
-            webhook_url = f"{BASE_URL}/webhook/twilio"
-            call_sid = await twilio.initiate_call(
-                to_number=phone_number,
-                livekit_room_name=room_name,
-                status_callback_url=webhook_url
-            )
+            logger.info(f"Created LiveKit room: {room_name} - agent will dial {phone_number}")
             
-            # Update call log with Twilio SID
+            # Update call log status
             await db.update_call_log(call_log_id, {
-                "call_sid": call_sid,
-                "status": "ringing"
+                "status": "initiated"
             })
             
-            logger.info(f"Initiated call {call_sid} to {phone_number}")
             return call_log_id
             
         except Exception as e:
-            logger.error(f"Failed to initiate Twilio call: {e}")
+            logger.error(f"Failed to create LiveKit room: {e}")
             await db.update_call_log(call_log_id, {
                 "status": "failed",
                 "failure_reason": f"Failed to initiate call: {str(e)}"
