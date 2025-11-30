@@ -11,19 +11,25 @@ import signal
 def main():
     port = os.getenv("PORT", "8000")
     
+    # Get the app directory (where this script lives)
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Set PYTHONPATH to include the app directory so imports work
+    env = os.environ.copy()
+    env["PYTHONPATH"] = app_dir
+    
     # Start FastAPI server
     web_process = subprocess.Popen([
         sys.executable, "-m", "uvicorn", 
         "main:app", 
         "--host", "0.0.0.0", 
         "--port", port
-    ])
+    ], env=env, cwd=app_dir)
     
     # Start LiveKit agent worker
-    # Use the praxa_agent module directly
     agent_process = subprocess.Popen([
-        sys.executable, "agent/praxa_agent.py", "dev"
-    ])
+        sys.executable, "-m", "agent.praxa_agent", "dev"
+    ], env=env, cwd=app_dir)
     
     def signal_handler(signum, frame):
         """Handle shutdown gracefully."""

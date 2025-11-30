@@ -1,12 +1,16 @@
 """LiveKit Agent for Praxa voice AI conversations."""
 
 import os
+import sys
 import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
 import json
+
+# Ensure the parent directory is in the path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from livekit import rtc
 from livekit.agents import (
@@ -23,7 +27,7 @@ from livekit.agents import (
 from livekit.plugins import deepgram, elevenlabs, openai, silero
 
 from services.supabase_client import get_supabase_client
-from .prompts import SYSTEM_PROMPT, get_user_context_prompt, get_opening_message, get_closing_message
+from agent.prompts import SYSTEM_PROMPT, get_user_context_prompt, get_opening_message, get_closing_message
 
 logger = logging.getLogger(__name__)
 
