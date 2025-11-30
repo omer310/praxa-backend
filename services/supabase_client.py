@@ -27,31 +27,42 @@ class SupabaseClient:
 
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
-        Fetch user along with their settings.
+        Fetch user settings directly by user_id.
+        
+        For MVP without auth, we query user_settings directly.
+        The user_id in user_settings IS the user identifier.
         
         Args:
-            user_id: The UUID of the user
+            user_id: The UUID of the user (matches user_id in user_settings)
             
         Returns:
             Dict with user and settings data, or None if not found
         """
         try:
-            # Get user
-            user_response = self.client.table("users").select("*").eq("id", user_id).single().execute()
-            
-            if not user_response.data:
-                logger.warning(f"User not found: {user_id}")
-                return None
-            
-            # Get settings
+            # Query user_settings directly - no users table needed for MVP
             settings_response = self.client.table("user_settings").select("*").eq("user_id", user_id).single().execute()
             
+            if not settings_response.data:
+                # Try querying by id if user_id doesn't match
+                settings_response = self.client.table("user_settings").select("*").eq("id", user_id).single().execute()
+            
+            if not settings_response.data:
+                logger.warning(f"User settings not found for: {user_id}")
+                return None
+            
+            settings = settings_response.data
+            
+            # Create a synthetic user object from settings for compatibility
             return {
-                "user": user_response.data,
-                "settings": settings_response.data if settings_response.data else None
+                "user": {
+                    "id": settings.get("user_id") or settings.get("id"),
+                    "email": settings.get("email", ""),
+                    "name": settings.get("name", ""),
+                },
+                "settings": settings
             }
         except Exception as e:
-            logger.error(f"Error fetching user with settings: {e}")
+            logger.error(f"Error fetching user settings: {e}")
             raise
 
     async def get_users_due_for_call(self) -> list[dict]:
@@ -59,14 +70,15 @@ class SupabaseClient:
         Get all users who are due for a scheduled call.
         
         Returns:
-            List of user data with settings for users due for calls
+            List of scheduled calls with user settings
         """
         try:
             now = datetime.utcnow().isoformat()
             
             # Query scheduled_calls that are due and pending
+            # Join with user_settings only (no users table for MVP)
             response = self.client.table("scheduled_calls").select(
-                "*, user_settings!inner(*, users!inner(*))"
+                "*, user_settings!inner(*)"
             ).eq("status", "pending").lte("scheduled_for", now).execute()
             
             return response.data or []
@@ -452,8 +464,9 @@ class SupabaseClient:
         try:
             now = datetime.utcnow().isoformat()
             
+            # Query without users table - just scheduled_calls and user_settings
             response = self.client.table("scheduled_calls").select(
-                "*, users!inner(id, email), user_settings!inner(*)"
+                "*, user_settings!inner(*)"
             ).eq("status", "pending").lte("scheduled_for", now).order("scheduled_for").execute()
             
             return response.data or []
@@ -559,11 +572,20 @@ class SupabaseClient:
             response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
             
             # Also update user_settings with next_scheduled_call
-            self.client.table("user_settings").update({
-                "next_scheduled_call": next_call.isoformat(),
-                "last_call_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("user_id", user_id).execute()
+            # Try updating by user_id first, then by id if that fails
+            try:
+                self.client.table("user_settings").update({
+                    "next_scheduled_call": next_call.isoformat(),
+                    "last_call_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("user_id", user_id).execute()
+            except Exception:
+                # Fallback to updating by id
+                self.client.table("user_settings").update({
+                    "next_scheduled_call": next_call.isoformat(),
+                    "last_call_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", user_id).execute()
             
             logger.info(f"Scheduled next call for user {user_id} at {next_call}")
             return response.data[0] if response.data else {}
