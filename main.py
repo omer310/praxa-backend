@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -55,6 +55,71 @@ BASE_URL = os.getenv("BASE_URL", f"http://localhost:{PORT}")
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+
+# Supabase configuration for JWT validation
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+
+async def verify_jwt_token(request: Request) -> dict:
+    """
+    Verify Supabase JWT token from Authorization header.
+    
+    This validates that the request comes from an authenticated Supabase user
+    by calling Supabase's auth/v1/user endpoint.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Dict with 'user_id' if token is valid
+        
+    Raises:
+        HTTPException with 401 status if token is invalid or missing
+    """
+    import httpx
+    
+    auth_header = request.headers.get("Authorization")
+    
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    # Extract token from "Bearer <token>"
+    parts = auth_header.split(" ")
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
+    
+    token = parts[1]
+    
+    try:
+        # Verify token by calling Supabase's auth endpoint
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.warning(f"JWT validation failed: {response.status_code}")
+                raise HTTPException(status_code=401, detail="Invalid token")
+            
+            user_data = response.json()
+            user_id = user_data.get("id")
+            
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Invalid token")
+            
+            return {"user_id": user_id}
+        
+    except httpx.RequestError as e:
+        logger.error(f"JWT validation error: {e}")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    except Exception as e:
+        logger.error(f"JWT validation error: {e}")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 async def trigger_call_for_user(user_id: str) -> Optional[dict]:
@@ -243,10 +308,13 @@ async def health_check():
 @app.post("/trigger-call", response_model=TriggerCallResponse)
 async def trigger_call(
     request: TriggerCallRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    auth: dict = Depends(verify_jwt_token)
 ):
     """
     Manually trigger a call for a user.
+    
+    **Requires Authentication**: Supabase JWT token in Authorization header
     
     This endpoint is useful for:
     - Testing the call flow
@@ -256,13 +324,19 @@ async def trigger_call(
     Args:
         request: Contains the user_id to call
         background_tasks: FastAPI background tasks handler
+        auth: Authenticated user info from JWT token (dependency)
         
     Returns:
         TriggerCallResponse with call details
     """
     user_id = str(request.user_id)
+    authenticated_user_id = auth["user_id"]
     
-    logger.info(f"Trigger call request for user: {user_id}")
+    # Security: Only allow users to trigger calls for themselves
+    if user_id != authenticated_user_id:
+        raise HTTPException(status_code=403, detail="Cannot trigger calls for other users")
+    
+    logger.info(f"Trigger call request for user: {user_id} (authenticated: {authenticated_user_id})")
     
     # Verify user exists
     db = get_supabase_client()
