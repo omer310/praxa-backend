@@ -27,31 +27,30 @@ class SupabaseClient:
 
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
-        Fetch user settings directly by ID.
-        For MVP without auth, we query user_settings by id (not user_id).
+        Fetch user settings by user_id.
         """
         try:
-            # For MVP: Query by the 'id' column directly (since user_id is NULL)
-            settings_response = self.client.table("user_settings").select("*").eq("id", user_id).single().execute()
+            # Query by the 'user_id' column (the FK to the user)
+            settings_response = self.client.table("user_settings").select("*").eq("user_id", user_id).execute()
             
-            if not settings_response.data:
+            if not settings_response.data or len(settings_response.data) == 0:
                 logger.warning(f"User settings not found for: {user_id}")
                 return None
             
-            settings = settings_response.data
+            settings = settings_response.data[0]  # Get first (and only) result
             
             # Create a synthetic user object from settings for compatibility
             return {
                 "user": {
                     "id": settings.get("id"),
-                    "email": "",
-                    "name": "",
+                    "email": settings.get("email", ""),
+                    "name": settings.get("name", ""),
                 },
                 "settings": settings
             }
         except Exception as e:
             logger.error(f"Error fetching user settings: {e}")
-            raise
+            return None  # Return None instead of raising, so endpoint can handle gracefully
 
     async def get_users_due_for_call(self) -> list[dict]:
         """
