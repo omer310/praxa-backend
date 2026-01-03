@@ -27,39 +27,37 @@ class SupabaseClient:
 
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
-        Fetch user along with their settings.
-        
-        Args:
-            user_id: The UUID of the user
-            
-        Returns:
-            Dict with user and settings data, or None if not found
+        Fetch user settings by user_id.
         """
         try:
-            # Get user
-            user_response = self.client.table("users").select("*").eq("id", user_id).single().execute()
+            # Query by the 'user_id' column (the FK to the user)
+            settings_response = self.client.table("user_settings").select("*").eq("user_id", user_id).execute()
             
-            if not user_response.data:
-                logger.warning(f"User not found: {user_id}")
+            if not settings_response.data or len(settings_response.data) == 0:
+                logger.warning(f"User settings not found for: {user_id}")
                 return None
             
-            # Get settings
-            settings_response = self.client.table("user_settings").select("*").eq("user_id", user_id).single().execute()
+            settings = settings_response.data[0]  # Get first (and only) result
             
+            # Create a synthetic user object from settings for compatibility
             return {
-                "user": user_response.data,
-                "settings": settings_response.data if settings_response.data else None
+                "user": {
+                    "id": settings.get("id"),
+                    "email": settings.get("email", ""),
+                    "name": settings.get("name", ""),
+                },
+                "settings": settings
             }
         except Exception as e:
-            logger.error(f"Error fetching user with settings: {e}")
-            raise
+            logger.error(f"Error fetching user settings: {e}")
+            return None  # Return None instead of raising, so endpoint can handle gracefully
 
     async def get_users_due_for_call(self) -> list[dict]:
         """
         Get all users who are due for a scheduled call.
         
         Returns:
-            List of user data with settings for users due for calls
+            List of scheduled calls with user settings
         """
         try:
             # Use timezone-aware datetime for PostgREST comparison
@@ -456,6 +454,114 @@ class SupabaseClient:
             logger.error(f"Error fetching call log by SID: {e}")
             return None
 
+    async def create_all_scheduled_calls(
+        self,
+        user_id: str,
+        checkin_schedule: list,
+        timezone: str,
+        checkin_enabled: bool = True
+    ) -> list[dict]:
+        """
+        Create all upcoming scheduled calls based on the checkin_schedule.
+        This creates calls for the next occurrence of each day in the schedule.
+        
+        Args:
+            user_id: The UUID of the user
+            checkin_schedule: List of schedule entries [{"day": 1, "time": "09:40", "label": "Monday"}, ...]
+            timezone: The user's timezone
+            checkin_enabled: Whether checkins are enabled
+            
+        Returns:
+            List of created scheduled calls
+        """
+        if not checkin_enabled or not checkin_schedule:
+            logger.info(f"Calls disabled or no schedule for user {user_id}")
+            return []
+        
+        try:
+            from zoneinfo import ZoneInfo
+            
+            # Get current time in user's timezone
+            user_tz = ZoneInfo(timezone)
+            now_local = datetime.now(user_tz)
+            
+            created_calls = []
+            
+            # Create a scheduled call for each entry
+            for schedule_entry in checkin_schedule:
+                day = schedule_entry.get("day")
+                time_str = schedule_entry.get("time")
+                label = schedule_entry.get("label", f"Day {day}")
+                
+                if day is None or not time_str:
+                    logger.warning(f"Invalid schedule entry: {schedule_entry}")
+                    continue
+                
+                # Parse time
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                except (ValueError, AttributeError):
+                    logger.warning(f"Invalid time format: {time_str}")
+                    continue
+                
+                # Calculate next occurrence
+                current_weekday = now_local.weekday()
+                if day == 0:  # Sunday
+                    target_weekday = 6
+                else:
+                    target_weekday = day - 1
+                
+                days_ahead = (target_weekday - current_weekday) % 7
+                next_call_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                next_call_local += timedelta(days=days_ahead)
+                
+                if next_call_local <= now_local:
+                    next_call_local += timedelta(days=7)
+                
+                # Convert to UTC
+                next_call_utc = next_call_local.astimezone(ZoneInfo("UTC"))
+                
+                # Determine time window
+                if hour < 12:
+                    time_window = "morning"
+                elif hour < 17:
+                    time_window = "afternoon"
+                else:
+                    time_window = "evening"
+                
+                # Create scheduled call
+                scheduled_call_data = {
+                    "user_id": user_id,
+                    "scheduled_for": next_call_utc.isoformat(),
+                    "time_window": time_window,
+                    "status": "pending",
+                    "attempt_count": 0,
+                    "max_attempts": 3,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                
+                response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
+                if response.data:
+                    created_calls.append(response.data[0])
+                    logger.info(f"Created scheduled call for {label} at {time_str} -> {next_call_utc.isoformat()} UTC")
+            
+            # Update user_settings with the earliest next scheduled call
+            if created_calls:
+                earliest = min(created_calls, key=lambda x: x["scheduled_for"])
+                try:
+                    self.client.table("user_settings").update({
+                        "next_scheduled_call": earliest["scheduled_for"],
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("user_id", user_id).execute()
+                except Exception as e:
+                    logger.warning(f"Could not update user_settings.next_scheduled_call: {e}")
+            
+            return created_calls
+        except Exception as e:
+            logger.error(f"Error creating scheduled calls: {e}", exc_info=True)
+            raise
+
     # ==================== Scheduled Calls ====================
 
     async def get_pending_scheduled_calls(self) -> list[dict]:
@@ -535,55 +641,200 @@ class SupabaseClient:
             "call_log_id": call_log_id
         })
 
-    async def schedule_next_call(
+    async def calculate_next_call_time(
         self,
         user_id: str,
-        frequency: str,
-        timezone: str,
-        time_window: str = "afternoon"
+        checkin_schedule: list,
+        timezone: str
     ) -> Optional[dict]:
         """
-        Schedule the next call for a user based on their frequency preference.
+        Calculate the next call time for a user based on their checkin_schedule.
+        Does NOT create a database record, just returns the calculation.
         
         Args:
             user_id: The UUID of the user
-            frequency: The checkin frequency (once_per_week, twice_per_week, off)
+            checkin_schedule: List of schedule entries
             timezone: The user's timezone
-            time_window: Preferred time window (morning, afternoon, evening)
+            
+        Returns:
+            Dict with next_call_utc, schedule_item, time_window, or None if invalid
+        """
+        if not checkin_schedule:
+            return None
+        
+        try:
+            from zoneinfo import ZoneInfo
+            
+            # Get current time in user's timezone
+            user_tz = ZoneInfo(timezone)
+            now_local = datetime.now(user_tz)
+            
+            # Find the next scheduled time
+            next_call_local = None
+            closest_schedule = None
+            
+            # Check each schedule entry and find the next occurrence
+            for schedule_entry in checkin_schedule:
+                day = schedule_entry.get("day")
+                time_str = schedule_entry.get("time")
+                
+                if day is None or not time_str:
+                    continue
+                
+                # Parse time
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                except (ValueError, AttributeError):
+                    continue
+                
+                # Calculate days until this day of week
+                current_weekday = now_local.weekday()
+                
+                # Convert schedule day to weekday format
+                if day == 0:  # Sunday
+                    target_weekday = 6
+                else:
+                    target_weekday = day - 1
+                
+                # Calculate days ahead
+                days_ahead = (target_weekday - current_weekday) % 7
+                
+                # Create the candidate datetime
+                candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                candidate += timedelta(days=days_ahead)
+                
+                # If this time has already passed today, add 7 days
+                if candidate <= now_local:
+                    candidate += timedelta(days=7)
+                
+                # Check if this is the earliest next occurrence
+                if next_call_local is None or candidate < next_call_local:
+                    next_call_local = candidate
+                    closest_schedule = schedule_entry
+            
+            if next_call_local is None:
+                return None
+            
+            # Convert to UTC
+            next_call_utc = next_call_local.astimezone(ZoneInfo("UTC"))
+            
+            # Determine time window
+            hour_local = next_call_local.hour
+            if hour_local < 12:
+                time_window = "morning"
+            elif hour_local < 17:
+                time_window = "afternoon"
+            else:
+                time_window = "evening"
+            
+            return {
+                "next_call_utc": next_call_utc,
+                "schedule_item": closest_schedule,
+                "time_window": time_window
+            }
+        except Exception as e:
+            logger.error(f"Error calculating next call time: {e}")
+            return None
+
+    async def schedule_next_call(
+        self,
+        user_id: str,
+        checkin_schedule: list,
+        timezone: str,
+        checkin_enabled: bool = True
+    ) -> Optional[dict]:
+        """
+        Schedule the next call for a user based on their checkin_schedule.
+        
+        Args:
+            user_id: The UUID of the user
+            checkin_schedule: List of schedule entries [{"day": 1, "time": "09:40", "label": "Monday"}, ...]
+                            where day is 0-6 (Sunday=0, Monday=1, ..., Saturday=6)
+            timezone: The user's timezone (e.g., "America/New_York")
+            checkin_enabled: Whether checkins are enabled
             
         Returns:
             Created scheduled call data, or None if calls are disabled
         """
-        if frequency == "off":
-            logger.info(f"Calls disabled for user {user_id}")
+        if not checkin_enabled or not checkin_schedule:
+            logger.info(f"Calls disabled or no schedule for user {user_id}")
             return None
         
         try:
-            # Calculate next call time based on frequency
-            now = datetime.utcnow()
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as dt
             
-            if frequency == "once_per_week":
-                # Schedule for 7 days from now
-                next_call = now + timedelta(days=7)
-            elif frequency == "twice_per_week":
-                # Schedule for 3-4 days from now
-                next_call = now + timedelta(days=3)
+            # Get current time in user's timezone
+            user_tz = ZoneInfo(timezone)
+            now_local = datetime.now(user_tz)
+            
+            # Find the next scheduled time
+            next_call_local = None
+            closest_schedule = None
+            
+            # Check each schedule entry and find the next occurrence
+            for schedule_entry in checkin_schedule:
+                day = schedule_entry.get("day")  # 0=Sunday, 1=Monday, etc.
+                time_str = schedule_entry.get("time")  # "HH:MM" format
+                
+                if day is None or not time_str:
+                    logger.warning(f"Invalid schedule entry: {schedule_entry}")
+                    continue
+                
+                # Parse time
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                except (ValueError, AttributeError):
+                    logger.warning(f"Invalid time format: {time_str}")
+                    continue
+                
+                # Calculate days until this day of week
+                current_weekday = now_local.weekday()
+                # Convert to same format (0=Sunday in schedule, but weekday() uses 0=Monday)
+                # schedule: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+                # weekday(): 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+                
+                # Convert schedule day to weekday format
+                if day == 0:  # Sunday
+                    target_weekday = 6
+                else:
+                    target_weekday = day - 1
+                
+                # Calculate days ahead
+                days_ahead = (target_weekday - current_weekday) % 7
+                
+                # Create the candidate datetime
+                candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                candidate += timedelta(days=days_ahead)
+                
+                # If this time has already passed today, add 7 days
+                if candidate <= now_local:
+                    candidate += timedelta(days=7)
+                
+                # Check if this is the earliest next occurrence
+                if next_call_local is None or candidate < next_call_local:
+                    next_call_local = candidate
+                    closest_schedule = schedule_entry
+            
+            if next_call_local is None:
+                logger.error(f"Could not calculate next call time for user {user_id}")
+                return None
+            
+            # Convert to UTC for storage
+            next_call_utc = next_call_local.astimezone(ZoneInfo("UTC"))
+            
+            # Determine time window for backward compatibility
+            hour_local = next_call_local.hour
+            if hour_local < 12:
+                time_window = "morning"
+            elif hour_local < 17:
+                time_window = "afternoon"
             else:
-                # Default to weekly
-                next_call = now + timedelta(days=7)
-            
-            # Adjust time based on time window (rough approximation in UTC)
-            # In production, you'd want to properly handle timezone conversion
-            if time_window == "morning":
-                next_call = next_call.replace(hour=14, minute=0, second=0)  # ~9am EST
-            elif time_window == "afternoon":
-                next_call = next_call.replace(hour=18, minute=0, second=0)  # ~1pm EST
-            else:  # evening
-                next_call = next_call.replace(hour=22, minute=0, second=0)  # ~5pm EST
+                time_window = "evening"
             
             scheduled_call_data = {
                 "user_id": user_id,
-                "scheduled_for": next_call.isoformat(),
+                "scheduled_for": next_call_utc.isoformat(),
                 "time_window": time_window,
                 "status": "pending",
                 "attempt_count": 0,
@@ -595,16 +846,19 @@ class SupabaseClient:
             response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
             
             # Also update user_settings with next_scheduled_call
-            self.client.table("user_settings").update({
-                "next_scheduled_call": next_call.isoformat(),
-                "last_call_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("user_id", user_id).execute()
+            try:
+                self.client.table("user_settings").update({
+                    "next_scheduled_call": next_call_utc.isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("user_id", user_id).execute()
+            except Exception as e:
+                logger.warning(f"Could not update user_settings.next_scheduled_call: {e}")
             
-            logger.info(f"Scheduled next call for user {user_id} at {next_call}")
+            schedule_label = closest_schedule.get("label", "scheduled day") if closest_schedule else "scheduled day"
+            logger.info(f"Scheduled next call for user {user_id} on {schedule_label} at {time_str} ({timezone}) -> {next_call_utc.isoformat()} UTC")
             return response.data[0] if response.data else {}
         except Exception as e:
-            logger.error(f"Error scheduling next call: {e}")
+            logger.error(f"Error scheduling next call: {e}", exc_info=True)
             raise
 
     # ==================== Bucket Operations ====================

@@ -641,6 +641,101 @@ class SupabaseClient:
             "call_log_id": call_log_id
         })
 
+    async def calculate_next_call_time(
+        self,
+        user_id: str,
+        checkin_schedule: list,
+        timezone: str
+    ) -> Optional[dict]:
+        """
+        Calculate the next call time for a user based on their checkin_schedule.
+        Does NOT create a database record, just returns the calculation.
+        
+        Args:
+            user_id: The UUID of the user
+            checkin_schedule: List of schedule entries
+            timezone: The user's timezone
+            
+        Returns:
+            Dict with next_call_utc, schedule_item, time_window, or None if invalid
+        """
+        if not checkin_schedule:
+            return None
+        
+        try:
+            from zoneinfo import ZoneInfo
+            
+            # Get current time in user's timezone
+            user_tz = ZoneInfo(timezone)
+            now_local = datetime.now(user_tz)
+            
+            # Find the next scheduled time
+            next_call_local = None
+            closest_schedule = None
+            
+            # Check each schedule entry and find the next occurrence
+            for schedule_entry in checkin_schedule:
+                day = schedule_entry.get("day")
+                time_str = schedule_entry.get("time")
+                
+                if day is None or not time_str:
+                    continue
+                
+                # Parse time
+                try:
+                    hour, minute = map(int, time_str.split(":"))
+                except (ValueError, AttributeError):
+                    continue
+                
+                # Calculate days until this day of week
+                current_weekday = now_local.weekday()
+                
+                # Convert schedule day to weekday format
+                if day == 0:  # Sunday
+                    target_weekday = 6
+                else:
+                    target_weekday = day - 1
+                
+                # Calculate days ahead
+                days_ahead = (target_weekday - current_weekday) % 7
+                
+                # Create the candidate datetime
+                candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                candidate += timedelta(days=days_ahead)
+                
+                # If this time has already passed today, add 7 days
+                if candidate <= now_local:
+                    candidate += timedelta(days=7)
+                
+                # Check if this is the earliest next occurrence
+                if next_call_local is None or candidate < next_call_local:
+                    next_call_local = candidate
+                    closest_schedule = schedule_entry
+            
+            if next_call_local is None:
+                return None
+            
+            # Convert to UTC
+            next_call_utc = next_call_local.astimezone(ZoneInfo("UTC"))
+            
+            # Determine time window
+            hour_local = next_call_local.hour
+            if hour_local < 12:
+                time_window = "morning"
+            elif hour_local < 17:
+                time_window = "afternoon"
+            else:
+                time_window = "evening"
+            
+            return {
+                "next_call_utc": next_call_utc,
+                "schedule_item": closest_schedule,
+                "time_window": time_window
+            }
+        except Exception as e:
+            logger.error(f"Error calculating next call time: {e}")
+            return None
+
     async def schedule_next_call(
         self,
         user_id: str,

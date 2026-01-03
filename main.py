@@ -561,26 +561,101 @@ async def sync_scheduled_calls(
         raise HTTPException(status_code=400, detail="User has no settings configured")
     
     try:
-        # Cancel all pending scheduled calls for this user
-        db.client.table("scheduled_calls").update({
-            "status": "cancelled",
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("user_id", user_id).eq("status", "pending").execute()
+        checkin_schedule = settings.get("checkin_schedule", [])
+        timezone_str = settings.get("timezone", "America/New_York")
+        checkin_enabled = settings.get("checkin_enabled", True)
         
-        logger.info(f"Cancelled pending scheduled calls for user {user_id}")
+        if not checkin_enabled or not checkin_schedule:
+            # Cancel all pending calls if checkin is disabled or no schedule
+            db.client.table("scheduled_calls").update({
+                "status": "cancelled",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("user_id", user_id).eq("status", "pending").execute()
+            
+            logger.info(f"Cancelled all pending calls for user {user_id} (checkin disabled or no schedule)")
+            return {"success": True, "scheduled_calls": [], "count": 0}
         
-        # Create new scheduled calls based on current checkin_schedule
-        created_calls = await db.create_all_scheduled_calls(
+        # Get existing pending scheduled calls
+        existing_response = db.client.table("scheduled_calls").select("*").eq(
+            "user_id", user_id
+        ).eq("status", "pending").execute()
+        
+        existing_calls = existing_response.data or []
+        
+        # Calculate the next call time based on new schedule
+        next_call_info = await db.calculate_next_call_time(
             user_id=user_id,
-            checkin_schedule=settings.get("checkin_schedule", []),
-            timezone=settings.get("timezone", "America/New_York"),
-            checkin_enabled=settings.get("checkin_enabled", True)
+            checkin_schedule=checkin_schedule,
+            timezone=timezone_str
         )
+        
+        if not next_call_info:
+            # No valid next call time, cancel all pending
+            db.client.table("scheduled_calls").update({
+                "status": "cancelled",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("user_id", user_id).eq("status", "pending").execute()
+            
+            logger.info(f"No valid next call time, cancelled all pending calls for user {user_id}")
+            return {"success": True, "scheduled_calls": [], "count": 0}
+        
+        next_call_utc = next_call_info["next_call_utc"]
+        schedule_item = next_call_info["schedule_item"]
+        
+        # Check if we already have a call scheduled close to this time (within 1 hour)
+        updated_call = None
+        for call in existing_calls:
+            call_time = datetime.fromisoformat(call["scheduled_for"].replace("+00:00", "").replace("Z", ""))
+            time_diff = abs((next_call_utc - call_time).total_seconds())
+            
+            # If within 24 hours of the same day/week pattern, update it
+            if time_diff < 86400:  # Within 24 hours
+                # Update the existing call's time
+                updated = db.client.table("scheduled_calls").update({
+                    "scheduled_for": next_call_utc.isoformat(),
+                    "time_window": schedule_item.get("time_window", "afternoon"),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", call["id"]).execute()
+                
+                updated_call = updated.data[0] if updated.data else None
+                logger.info(f"Updated scheduled call {call['id']} to new time {next_call_utc.isoformat()}")
+                
+                # Cancel all other pending calls
+                db.client.table("scheduled_calls").update({
+                    "status": "cancelled",
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("user_id", user_id).eq("status", "pending").neq("id", call["id"]).execute()
+                
+                break
+        
+        # If no existing call was updated, create a new one
+        if not updated_call:
+            # Cancel all old pending calls
+            db.client.table("scheduled_calls").update({
+                "status": "cancelled",
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("user_id", user_id).eq("status", "pending").execute()
+            
+            # Create new scheduled call
+            created_calls = await db.create_all_scheduled_calls(
+                user_id=user_id,
+                checkin_schedule=checkin_schedule,
+                timezone=timezone_str,
+                checkin_enabled=checkin_enabled
+            )
+            
+            logger.info(f"Created new scheduled call for user {user_id}")
+            return {
+                "success": True,
+                "scheduled_calls": created_calls,
+                "count": len(created_calls)
+            }
         
         return {
             "success": True,
-            "scheduled_calls": created_calls,
-            "count": len(created_calls)
+            "scheduled_calls": [updated_call],
+            "count": 1,
+            "updated": True
         }
     except Exception as e:
         logger.error(f"Error syncing scheduled calls: {e}")
