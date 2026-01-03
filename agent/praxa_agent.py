@@ -213,9 +213,9 @@ class PraxaAgent:
             if self.user_settings:
                 await self.db.schedule_next_call(
                     user_id=self.user_id,
-                    frequency=self.user_settings.get("checkin_frequency", "once_per_week"),
+                    checkin_schedule=self.user_settings.get("checkin_schedule", []),
                     timezone=self.user_settings.get("timezone", "America/New_York"),
-                    time_window=self.user_settings.get("checkin_time_window", "afternoon")
+                    checkin_enabled=self.user_settings.get("checkin_enabled", True)
                 )
             
             logger.info(

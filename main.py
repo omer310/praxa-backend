@@ -484,9 +484,9 @@ async def schedule_call(user_id: str):
     # Schedule the call
     scheduled = await db.schedule_next_call(
         user_id=user_id,
-        frequency=settings.get("checkin_frequency", "once_per_week"),
+        checkin_schedule=settings.get("checkin_schedule", []),
         timezone=settings.get("timezone", "America/New_York"),
-        time_window=settings.get("checkin_time_window", "afternoon")
+        checkin_enabled=settings.get("checkin_enabled", True)
     )
     
     if not scheduled:
@@ -496,6 +496,73 @@ async def schedule_call(user_id: str):
         "success": True,
         "scheduled_call": scheduled
     }
+
+
+@app.post("/sync-scheduled-calls")
+async def sync_scheduled_calls(
+    user_id: str,
+    auth: dict = Depends(verify_jwt_token)
+):
+    """
+    Sync scheduled calls for a user based on their current checkin_schedule.
+    This should be called when the user updates their schedule in the app.
+    
+    It will:
+    1. Cancel all pending scheduled calls for this user
+    2. Create new scheduled calls based on the current checkin_schedule
+    
+    **Requires Authentication**: Supabase JWT token in Authorization header
+    
+    Args:
+        user_id: The UUID of the user
+        auth: Authenticated user info from JWT token (dependency)
+        
+    Returns:
+        List of newly created scheduled calls
+    """
+    authenticated_user_id = auth["user_id"]
+    
+    # Security: Only allow users to sync their own calls
+    if user_id != authenticated_user_id:
+        raise HTTPException(status_code=403, detail="Cannot sync calls for other users")
+    
+    db = get_supabase_client()
+    
+    # Get user settings
+    user_data = await db.get_user_with_settings(user_id)
+    
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    settings = user_data.get("settings")
+    if not settings:
+        raise HTTPException(status_code=400, detail="User has no settings configured")
+    
+    try:
+        # Cancel all pending scheduled calls for this user
+        db.client.table("scheduled_calls").update({
+            "status": "cancelled",
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("user_id", user_id).eq("status", "pending").execute()
+        
+        logger.info(f"Cancelled pending scheduled calls for user {user_id}")
+        
+        # Create new scheduled calls based on current checkin_schedule
+        created_calls = await db.create_all_scheduled_calls(
+            user_id=user_id,
+            checkin_schedule=settings.get("checkin_schedule", []),
+            timezone=settings.get("timezone", "America/New_York"),
+            checkin_enabled=settings.get("checkin_enabled", True)
+        )
+        
+        return {
+            "success": True,
+            "scheduled_calls": created_calls,
+            "count": len(created_calls)
+        }
+    except Exception as e:
+        logger.error(f"Error syncing scheduled calls: {e}")
+        raise HTTPException(status_code=500, detail="Failed to sync scheduled calls")
 
 
 @app.get("/call-logs/{user_id}")

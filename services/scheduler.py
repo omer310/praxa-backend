@@ -104,7 +104,14 @@ class CallScheduler:
             
             # Trigger the call
             logger.info(f"Triggering call for user {user_id}")
-            await self.trigger_callback(user_id)
+            result = await self.trigger_callback(user_id)
+            
+            # Schedule the next call for this user based on their checkin_schedule
+            if result:
+                try:
+                    await self._schedule_next_for_user(user_id, user_settings)
+                except Exception as e:
+                    logger.error(f"Failed to schedule next call for user {user_id}: {e}")
             
             # Note: The call log completion will be handled by the agent
             # The scheduled_call will be marked complete when the call ends
@@ -125,6 +132,36 @@ class CallScheduler:
                     "status": "pending"
                 })
                 logger.info(f"Scheduled call {call_id} will retry (attempt {attempt_count + 1}/{max_attempts})")
+
+    async def _schedule_next_for_user(self, user_id: str, user_settings: dict):
+        """
+        Schedule the next call for a user after completing the current one.
+        
+        Args:
+            user_id: The UUID of the user
+            user_settings: The user's settings including checkin_schedule
+        """
+        db = get_supabase_client()
+        
+        try:
+            checkin_schedule = user_settings.get("checkin_schedule", [])
+            checkin_enabled = user_settings.get("checkin_enabled", True)
+            timezone = user_settings.get("timezone", "America/New_York")
+            
+            if not checkin_enabled or not checkin_schedule:
+                logger.info(f"Checkins disabled or no schedule for user {user_id}")
+                return
+            
+            # Schedule the next call
+            await db.schedule_next_call(
+                user_id=user_id,
+                checkin_schedule=checkin_schedule,
+                timezone=timezone,
+                checkin_enabled=checkin_enabled
+            )
+            logger.info(f"Successfully scheduled next call for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error scheduling next call for user {user_id}: {e}")
 
     def start(self):
         """Start the background scheduler."""
