@@ -62,7 +62,9 @@ class SupabaseClient:
             List of user data with settings for users due for calls
         """
         try:
-            now = datetime.utcnow().isoformat()
+            # Use timezone-aware datetime for PostgREST comparison
+            from datetime import timezone
+            now = datetime.now(timezone.utc).isoformat()
             
             # Query scheduled_calls only (no JOIN needed)
             response = self.client.table("scheduled_calls").select(
@@ -464,7 +466,11 @@ class SupabaseClient:
             List of scheduled calls that are ready to be processed
         """
         try:
-            now = datetime.utcnow().isoformat()
+            # Use timezone-aware datetime for PostgREST comparison
+            from datetime import timezone
+            now = datetime.now(timezone.utc).isoformat()
+            
+            logger.info(f"Querying scheduled_calls with now={now}")
             
             # Query scheduled_calls only (no JOIN needed)
             response = self.client.table("scheduled_calls").select(
@@ -473,6 +479,7 @@ class SupabaseClient:
             
             # For each scheduled call, fetch the user settings separately
             scheduled_calls = response.data or []
+            logger.info(f"Found {len(scheduled_calls)} pending scheduled calls")
             for call in scheduled_calls:
                 if call.get("user_id"):
                     try:
