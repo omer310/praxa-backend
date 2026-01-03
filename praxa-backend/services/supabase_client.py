@@ -64,12 +64,26 @@ class SupabaseClient:
         try:
             now = datetime.utcnow().isoformat()
             
-            # Query scheduled_calls that are due and pending
+            # Query scheduled_calls only (no JOIN needed)
             response = self.client.table("scheduled_calls").select(
-                "*, user_settings!inner(*, users!inner(*))"
+                "*"
             ).eq("status", "pending").lte("scheduled_for", now).execute()
             
-            return response.data or []
+            # For each scheduled call, fetch the user settings separately
+            scheduled_calls = response.data or []
+            for call in scheduled_calls:
+                if call.get("user_id"):
+                    try:
+                        settings_response = self.client.table("user_settings").select(
+                            "*"
+                        ).eq("user_id", call["user_id"]).execute()
+                        if settings_response.data:
+                            call["user_settings"] = settings_response.data[0]
+                    except Exception as e:
+                        logger.warning(f"Could not fetch user_settings for scheduled call {call['id']}: {e}")
+                        call["user_settings"] = {}
+            
+            return scheduled_calls
         except Exception as e:
             logger.error(f"Error fetching users due for call: {e}")
             raise
@@ -452,11 +466,26 @@ class SupabaseClient:
         try:
             now = datetime.utcnow().isoformat()
             
+            # Query scheduled_calls only (no JOIN needed)
             response = self.client.table("scheduled_calls").select(
-                "*, users!inner(id, email), user_settings!inner(*)"
+                "*"
             ).eq("status", "pending").lte("scheduled_for", now).order("scheduled_for").execute()
             
-            return response.data or []
+            # For each scheduled call, fetch the user settings separately
+            scheduled_calls = response.data or []
+            for call in scheduled_calls:
+                if call.get("user_id"):
+                    try:
+                        settings_response = self.client.table("user_settings").select(
+                            "*"
+                        ).eq("user_id", call["user_id"]).execute()
+                        if settings_response.data:
+                            call["user_settings"] = settings_response.data[0]
+                    except Exception as e:
+                        logger.warning(f"Could not fetch user_settings for scheduled call {call['id']}: {e}")
+                        call["user_settings"] = {}
+            
+            return scheduled_calls
         except Exception as e:
             logger.error(f"Error fetching pending scheduled calls: {e}")
             raise

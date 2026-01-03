@@ -54,11 +54,13 @@ Context about the user's data:
 Conversation Flow Guidelines:
 1. Start with a warm greeting and ask how they're doing
 2. Briefly mention how many tasks they have for this week
-3. Go through their priority tasks one by one
-4. For each task, ask about progress - then USE TOOLS based on their response
-5. Proactively capture any insights, blockers, or progress as notes
-6. Offer suggestions and if they agree, add them as notes or create follow-up tasks
-7. Wrap up with encouragement and mention when you'll call next
+3. IF calendar access available, mention their calendar (e.g., "I see you have 12 meetings this week - Tuesday looks busy")
+4. Go through their priority tasks one by one
+5. For each task, ask about progress - then USE TOOLS based on their response
+6. Proactively capture any insights, blockers, or progress as notes
+7. Offer suggestions and if they agree, add them as notes or create follow-up tasks
+8. When discussing scheduling, check their calendar to find good times for focused work
+9. Wrap up with encouragement and mention when you'll call next
 
 Keep the call focused and efficient - aim for 3-5 minutes unless the user wants to chat more.
 End the call naturally when the user seems ready to wrap up.
@@ -76,7 +78,9 @@ def get_user_context_prompt(
     this_week_tasks: list[dict],
     overdue_tasks: list[dict],
     recently_completed: list[dict],
-    checkin_frequency: str
+    checkin_frequency: str,
+    calendar_events: list[dict] = None,
+    calendar_busy_count: int = 0
 ) -> str:
     """
     Generate user-specific context to include in the system prompt.
@@ -88,6 +92,8 @@ def get_user_context_prompt(
         overdue_tasks: Tasks past their due date
         recently_completed: Tasks completed in the past week
         checkin_frequency: How often the user gets calls
+        calendar_events: Calendar events for this week (optional)
+        calendar_busy_count: Number of calendar events (optional)
         
     Returns:
         A formatted string with user context
@@ -144,6 +150,46 @@ def get_user_context_prompt(
         context_parts.append(
             f"Recently completed ({len(recently_completed)} in past week) - celebrate these!:\n" + "\n".join(completed_list)
         )
+    
+    # Calendar context (if available)
+    if calendar_events is not None and calendar_busy_count > 0:
+        from datetime import datetime, timedelta
+        
+        # Group events by day for summary
+        today = datetime.now().date()
+        week_days = {}
+        
+        for event in calendar_events:
+            when = event.get("when", {})
+            start_time_str = when.get("start_time") or when.get("date")
+            
+            if not start_time_str:
+                continue
+            
+            try:
+                event_date = datetime.fromisoformat(start_time_str.replace('Z', '+00:00')).date()
+                if event_date < today or event_date > today + timedelta(days=7):
+                    continue
+                
+                day_name = event_date.strftime("%A")
+                if day_name not in week_days:
+                    week_days[day_name] = 0
+                week_days[day_name] += 1
+            except:
+                continue
+        
+        if week_days:
+            busiest_day = max(week_days.items(), key=lambda x: x[1])
+            lightest_days = [day for day, count in week_days.items() if count <= 2]
+            
+            calendar_summary = f"CALENDAR: {calendar_busy_count} events this week. "
+            if busiest_day[1] > 3:
+                calendar_summary += f"{busiest_day[0]} is busiest with {busiest_day[1]} meetings. "
+            if lightest_days:
+                calendar_summary += f"{lightest_days[0]} looks lighter - good for focused work. "
+            
+            calendar_summary += "\nUse get_calendar_overview() or get_todays_calendar() tools to discuss their calendar when relevant."
+            context_parts.append(calendar_summary)
     
     # Frequency info
     freq_map = {

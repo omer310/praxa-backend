@@ -57,7 +57,13 @@ LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
 from services.supabase_client import get_supabase_client
 from agent.prompts import SYSTEM_PROMPT, get_user_context_prompt, get_opening_message, get_closing_message
 
+# For calendar access
+import httpx
+
 logger = logging.getLogger(__name__)
+
+# Nylas API configuration
+NYLAS_API_KEY = os.getenv("NYLAS_API_KEY", "")
 
 
 class PraxaAgent:
@@ -72,9 +78,10 @@ class PraxaAgent:
     5. Can take actions like marking tasks complete, adding notes, creating tasks
     """
 
-    def __init__(self, user_id: str, call_log_id: str):
+    def __init__(self, user_id: str, call_log_id: str, calendar_grant_id: Optional[str] = None):
         self.user_id = user_id
         self.call_log_id = call_log_id
+        self.calendar_grant_id = calendar_grant_id
         self.db = get_supabase_client()
         
         # Call tracking
@@ -92,6 +99,10 @@ class PraxaAgent:
         self.this_week_tasks: list[dict] = []
         self.overdue_tasks: list[dict] = []
         self.recently_completed: list[dict] = []
+        
+        # Calendar context (loaded if grant ID available)
+        self.calendar_events: list[dict] = []
+        self.calendar_busy_count: int = 0
 
     async def load_user_context(self):
         """Load all user data needed for the conversation."""
@@ -116,17 +127,77 @@ class PraxaAgent:
             # Get recently completed
             self.recently_completed = await self.db.get_recently_completed_tasks(self.user_id)
             
+            # Load calendar if grant ID available
+            if self.calendar_grant_id:
+                try:
+                    await self._load_calendar_context()
+                except Exception as e:
+                    logger.warning(f"Error loading calendar context: {e}")
+                    # Don't fail the call if calendar fails
+            
             logger.info(
                 f"Loaded context for user {self.user_id}: "
                 f"{len(self.buckets)} buckets, "
                 f"{len(self.this_week_tasks)} this week tasks, "
                 f"{len(self.overdue_tasks)} overdue, "
-                f"{len(self.recently_completed)} recently completed"
+                f"{len(self.recently_completed)} recently completed, "
+                f"{len(self.calendar_events)} calendar events"
             )
             
         except Exception as e:
             logger.error(f"Error loading user context: {e}")
             raise
+
+    async def _load_calendar_context(self):
+        """Load calendar events for the upcoming week."""
+        if not NYLAS_API_KEY or not self.calendar_grant_id:
+            return
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Get primary calendar
+                calendars_url = f"https://api.us.nylas.com/v3/grants/{self.calendar_grant_id}/calendars"
+                cal_response = await client.get(
+                    calendars_url,
+                    headers={
+                        "Authorization": f"Bearer {NYLAS_API_KEY}",
+                        "Accept": "application/json"
+                    }
+                )
+                
+                if cal_response.status_code != 200:
+                    logger.warning(f"Failed to fetch calendars: {cal_response.status_code}")
+                    return
+                
+                calendars = cal_response.json().get("data", [])
+                if not calendars:
+                    return
+                
+                calendar_id = calendars[0].get("id")
+                
+                # Get events for next 7 days
+                events_url = f"https://api.us.nylas.com/v3/grants/{self.calendar_grant_id}/events"
+                events_response = await client.get(
+                    events_url,
+                    headers={
+                        "Authorization": f"Bearer {NYLAS_API_KEY}",
+                        "Accept": "application/json"
+                    },
+                    params={"calendar_id": calendar_id, "limit": 50}
+                )
+                
+                if events_response.status_code == 200:
+                    self.calendar_events = events_response.json().get("data", [])
+                    
+                    # Count how many events this week (simple metric for "busy-ness")
+                    self.calendar_busy_count = len(self.calendar_events)
+                    
+                    logger.info(f"Loaded {len(self.calendar_events)} calendar events")
+                else:
+                    logger.warning(f"Failed to fetch events: {events_response.status_code}")
+        
+        except Exception as e:
+            logger.warning(f"Error fetching calendar data: {e}")
 
     def _build_system_prompt(self) -> str:
         """Build the complete system prompt with user context."""
@@ -139,7 +210,9 @@ class PraxaAgent:
             this_week_tasks=self.this_week_tasks,
             overdue_tasks=self.overdue_tasks,
             recently_completed=self.recently_completed,
-            checkin_frequency=checkin_frequency
+            checkin_frequency=checkin_frequency,
+            calendar_events=self.calendar_events if self.calendar_grant_id else None,
+            calendar_busy_count=self.calendar_busy_count
         )
         
         return f"{SYSTEM_PROMPT}\n\n--- USER CONTEXT ---\n{context_prompt}"
@@ -360,6 +433,99 @@ Transcript:
             logger.error(f"Error listing buckets: {e}")
             return "Sorry, I had trouble getting your buckets."
 
+    async def get_calendar_overview(self) -> str:
+        """Get a brief overview of the calendar for this week."""
+        if not self.calendar_grant_id or not self.calendar_events:
+            return "I don't have access to your calendar right now."
+        
+        try:
+            from datetime import datetime, timedelta
+            
+            # Group events by day
+            today = datetime.now().date()
+            week_days = {}
+            
+            for event in self.calendar_events:
+                when = event.get("when", {})
+                start_time_str = when.get("start_time") or when.get("date")
+                
+                if not start_time_str:
+                    continue
+                
+                try:
+                    # Parse the date
+                    event_date = datetime.fromisoformat(start_time_str.replace('Z', '+00:00')).date()
+                    
+                    # Only include events in next 7 days
+                    if event_date < today or event_date > today + timedelta(days=7):
+                        continue
+                    
+                    day_name = event_date.strftime("%A")
+                    if day_name not in week_days:
+                        week_days[day_name] = 0
+                    week_days[day_name] += 1
+                except:
+                    continue
+            
+            if not week_days:
+                return "Your calendar looks pretty open this week."
+            
+            # Find busiest and lightest days
+            busiest_day = max(week_days.items(), key=lambda x: x[1])
+            lightest_day = min(week_days.items(), key=lambda x: x[1])
+            
+            total_events = sum(week_days.values())
+            
+            response = f"You have {total_events} events this week. "
+            
+            if busiest_day[1] > 3:
+                response += f"{busiest_day[0]} is your busiest day with {busiest_day[1]} meetings. "
+            
+            if lightest_day[1] <= 2 and lightest_day[0] != busiest_day[0]:
+                response += f"{lightest_day[0]} looks lighter with only {lightest_day[1]} meetings - good day for focused work."
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error getting calendar overview: {e}")
+            return "I had trouble analyzing your calendar."
+
+    async def get_todays_calendar(self) -> str:
+        """Get today's calendar events."""
+        if not self.calendar_grant_id or not self.calendar_events:
+            return "I don't have access to your calendar right now."
+        
+        try:
+            from datetime import datetime
+            
+            today = datetime.now().date()
+            today_events = []
+            
+            for event in self.calendar_events:
+                when = event.get("when", {})
+                start_time_str = when.get("start_time") or when.get("date")
+                
+                if not start_time_str:
+                    continue
+                
+                try:
+                    event_date = datetime.fromisoformat(start_time_str.replace('Z', '+00:00')).date()
+                    if event_date == today:
+                        title = event.get("title", "Untitled")
+                        time_str = start_time_str.split("T")[1][:5] if "T" in start_time_str else ""
+                        today_events.append(f"{title} at {time_str}" if time_str else title)
+                except:
+                    continue
+            
+            if not today_events:
+                return "You don't have any events scheduled for today."
+            
+            return f"Today you have: {', '.join(today_events)}"
+            
+        except Exception as e:
+            logger.error(f"Error getting today's calendar: {e}")
+            return "I had trouble getting today's events."
+
 
 # Global agent instance for the current session
 _current_agent: Optional[PraxaAgent] = None
@@ -418,6 +584,16 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         async def list_buckets(self) -> str:
             """Get the list of user's buckets/initiatives. Use when you need to know what buckets exist."""
             return await praxa.list_buckets()
+        
+        @function_tool
+        async def get_calendar_overview(self) -> str:
+            """Get an overview of the user's calendar for this week. Shows busy days and best days for focused work."""
+            return await praxa.get_calendar_overview()
+        
+        @function_tool
+        async def get_todays_calendar(self) -> str:
+            """Get today's calendar events. Use when user asks about today's schedule."""
+            return await praxa.get_todays_calendar()
     
     return PraxaVoiceAgent
 
@@ -463,6 +639,7 @@ async def entrypoint(ctx: JobContext):
         user_id = metadata.get("user_id")
         call_log_id = metadata.get("call_log_id")
         phone_number = metadata.get("phone_number")
+        calendar_grant_id = metadata.get("calendar_grant_id")
         
         # Fallback to parsing room name if metadata is missing
         if not user_id:
@@ -478,13 +655,21 @@ async def entrypoint(ctx: JobContext):
         if not phone_number:
             logger.error(f"No phone_number in room metadata: {room_name}, metadata was: {room_metadata}")
             return
+        
+        # Log calendar availability
+        if calendar_grant_id:
+            print(f"Calendar grant ID available: {calendar_grant_id[:20]}...", flush=True)
+            logger.info(f"Calendar grant ID available for user {user_id}")
+        else:
+            print("No calendar grant ID - calendar features will be unavailable", flush=True)
+            logger.info("No calendar grant ID - agent will skip calendar features")
             
     except Exception as e:
         logger.error(f"Error parsing room metadata: {e}")
         return
     
-    # Create the Praxa agent instance
-    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id or "unknown")
+    # Create the Praxa agent instance with calendar access if available
+    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id or "unknown", calendar_grant_id=calendar_grant_id)
     _current_agent = praxa
     
     # Load user context
