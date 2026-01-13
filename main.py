@@ -19,12 +19,16 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Form, Depe
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from livekit import api as livekit_api
 
 from models.schemas import (
     TriggerCallRequest,
     TriggerCallResponse,
+    ScheduleCallRequest,
     HealthResponse,
     CallStatus,
 )
@@ -63,9 +67,9 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 async def verify_jwt_token(request: Request) -> dict:
     """
-    Verify Supabase JWT token from Authorization header.
+    Verify Supabase JWT token using Supabase client.
     
-    This decodes the JWT token directly without external calls.
+    This properly verifies the JWT signature using Supabase's auth system.
     
     Args:
         request: FastAPI Request object
@@ -76,38 +80,27 @@ async def verify_jwt_token(request: Request) -> dict:
     Raises:
         HTTPException with 401 status if token is invalid or missing
     """
-    import jwt
-    
     auth_header = request.headers.get("Authorization")
     
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     
-    # Extract token from "Bearer <token>"
-    parts = auth_header.split(" ")
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header format")
-    
-    token = parts[1]
+    token = auth_header.split(" ")[1]
     
     try:
-        # Decode JWT token
-        # Supabase uses HS256 signing with SUPABASE_JWT_SECRET
-        # We can decode without verification for now (Supabase should verify it was valid when created)
-        payload = jwt.decode(token, options={"verify_signature": False})
+        # Use Supabase client to verify the token properly
+        supabase_client = get_supabase_client()
         
-        user_id = payload.get("sub")  # "sub" is the user ID in Supabase JWT
+        # Verify token by getting user - this validates the JWT signature
+        response = supabase_client.client.auth.get_user(token)
         
-        if not user_id:
+        if not response or not response.user:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        return {"user_id": user_id}
+        return {"user_id": response.user.id}
         
-    except jwt.DecodeError as e:
-        logger.error(f"JWT decode error: {e}")
-        raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
-        logger.error(f"JWT validation error: {e}")
+        logger.error(f"JWT verification error: {e}")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -281,6 +274,9 @@ async def lifespan(app: FastAPI):
     logger.info("Praxa Backend shut down")
 
 
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=["100/hour"])
+
 # Create FastAPI app
 app = FastAPI(
     title="Praxa Backend",
@@ -289,12 +285,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Add rate limiter to app state
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Configure CORS with environment-specific origins
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else []
+
+# In development, allow localhost for testing
+if ENVIRONMENT == "development":
+    ALLOWED_ORIGINS.extend(["http://localhost:8081", "http://localhost:19000", "http://127.0.0.1:8081"])
+    logger.info(f"Development mode: CORS origins = {ALLOWED_ORIGINS}")
+else:
+    # Production: mobile apps don't need CORS (native requests), only for admin tools
+    logger.info(f"Production mode: CORS origins = {ALLOWED_ORIGINS}")
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else [],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -317,7 +328,9 @@ async def health_check():
 
 
 @app.post("/trigger-call", response_model=TriggerCallResponse)
+@limiter.limit("10/minute")  # Max 10 calls per minute per IP
 async def trigger_call(
+    req: Request,
     request: TriggerCallRequest,
     background_tasks: BackgroundTasks,
     auth: dict = Depends(verify_jwt_token)
@@ -379,6 +392,7 @@ async def trigger_call(
 
 
 @app.post("/webhook/twilio")
+@limiter.limit("100/minute")  # Allow high volume from Twilio, but prevent abuse
 async def twilio_webhook(request: Request):
     """
     Webhook endpoint for Twilio call status updates.
@@ -478,7 +492,8 @@ async def list_scheduled_calls():
 
 
 @app.post("/schedule-call")
-async def schedule_call(user_id: str):
+@limiter.limit("20/minute")  # Max 20 schedule requests per minute per IP
+async def schedule_call(req: Request, request: ScheduleCallRequest):
     """
     Manually schedule a call for a user.
     
@@ -494,7 +509,7 @@ async def schedule_call(user_id: str):
     db = get_supabase_client()
     
     # Get user settings
-    user_data = await db.get_user_with_settings(user_id)
+    user_data = await db.get_user_with_settings(str(request.user_id))
     
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -505,7 +520,7 @@ async def schedule_call(user_id: str):
     
     # Schedule the call
     scheduled = await db.schedule_next_call(
-        user_id=user_id,
+        user_id=str(request.user_id),
         checkin_schedule=settings.get("checkin_schedule", []),
         timezone=settings.get("timezone", "America/New_York"),
         checkin_enabled=settings.get("checkin_enabled", True)

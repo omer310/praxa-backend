@@ -196,6 +196,13 @@ class TriggerCallRequest(BaseModel):
     user_id: UUID
 
 
+class ScheduleCallRequest(BaseModel):
+    """Request body for scheduling a call."""
+    user_id: UUID = Field(..., description="User ID to schedule call for")
+    scheduled_for: Optional[datetime] = Field(None, description="Specific datetime to schedule call")
+    time_window: Optional[str] = Field(None, description="Time window preference: morning, afternoon, or evening")
+
+
 class TriggerCallResponse(BaseModel):
     """Response for trigger call endpoint."""
     success: bool

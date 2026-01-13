@@ -15,6 +15,7 @@ supabase>=2.0.0
 # HTTP server for webhooks/triggers
 fastapi>=0.109.0
 uvicorn>=0.27.0
+slowapi>=0.1.9  # Rate limiting
 
 # Background tasks
 apscheduler>=3.10.0
