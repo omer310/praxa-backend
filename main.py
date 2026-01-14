@@ -330,8 +330,8 @@ async def health_check():
 @app.post("/trigger-call", response_model=TriggerCallResponse)
 @limiter.limit("10/minute")  # Max 10 calls per minute per IP
 async def trigger_call(
-    req: Request,
-    request: TriggerCallRequest,
+    request: Request,
+    call_request: TriggerCallRequest,
     background_tasks: BackgroundTasks,
     auth: dict = Depends(verify_jwt_token)
 ):
@@ -353,7 +353,7 @@ async def trigger_call(
     Returns:
         TriggerCallResponse with call details
     """
-    user_id = str(request.user_id)
+    user_id = str(call_request.user_id)
     authenticated_user_id = auth["user_id"]
     
     # Security: Only allow users to trigger calls for themselves
@@ -493,7 +493,7 @@ async def list_scheduled_calls():
 
 @app.post("/schedule-call")
 @limiter.limit("20/minute")  # Max 20 schedule requests per minute per IP
-async def schedule_call(req: Request, request: ScheduleCallRequest):
+async def schedule_call(request: Request, schedule_request: ScheduleCallRequest):
     """
     Manually schedule a call for a user.
     
@@ -509,7 +509,7 @@ async def schedule_call(req: Request, request: ScheduleCallRequest):
     db = get_supabase_client()
     
     # Get user settings
-    user_data = await db.get_user_with_settings(str(request.user_id))
+    user_data = await db.get_user_with_settings(str(schedule_request.user_id))
     
     if not user_data:
         raise HTTPException(status_code=404, detail="User not found")
@@ -520,7 +520,7 @@ async def schedule_call(req: Request, request: ScheduleCallRequest):
     
     # Schedule the call
     scheduled = await db.schedule_next_call(
-        user_id=str(request.user_id),
+        user_id=str(schedule_request.user_id),
         checkin_schedule=settings.get("checkin_schedule", []),
         timezone=settings.get("timezone", "America/New_York"),
         checkin_enabled=settings.get("checkin_enabled", True)
