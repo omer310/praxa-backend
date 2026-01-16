@@ -797,32 +797,46 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("AgentSession created successfully")
         
-        # Track transcripts using session events
-        # Use both "committed" (finalized) and "interrupted" (cut off) events
+        # Track transcripts using LiveKit Agents v1.0+ patterns
         logger.info("[TRANSCRIPT DEBUG] Setting up transcript event listeners...")
+        print("[TRANSCRIPT DEBUG] Setting up transcript event listeners...", flush=True)
         
-        @session.on("user_speech_committed")
-        def on_user_speech(msg):
-            content = msg.content if hasattr(msg, 'content') else str(msg)
-            print(f"[🎤 USER] {content[:80]}...", flush=True)
-            logger.info(f"[TRANSCRIPT DEBUG] EVENT: user_speech_committed - {content[:50]}...")
-            praxa.on_transcript_update("user", content)
+        # Track logged messages to avoid duplicates
+        praxa._logged_messages = set()
         
-        @session.on("agent_speech_committed") 
-        def on_agent_speech(msg):
-            content = msg.content if hasattr(msg, 'content') else str(msg)
-            print(f"[🤖 AGENT] {content[:80]}...", flush=True)
-            logger.info(f"[TRANSCRIPT DEBUG] EVENT: agent_speech_committed - {content[:50]}...")
-            praxa.on_transcript_update("assistant", content)
+        # Listen to conversation_item_added - the main event for conversation tracking
+        @session.on("conversation_item_added")
+        def on_conversation_item(item):
+            try:
+                role = item.role if hasattr(item, 'role') else 'assistant'
+                content = item.content if hasattr(item, 'content') else str(item)
+                
+                # Create unique ID to prevent duplicates
+                message_id = f"{role}:{content[:50]}"
+                if message_id not in praxa._logged_messages:
+                    print(f"[{'🎤 USER' if role == 'user' else '🤖 AGENT'}] {content[:80]}...", flush=True)
+                    logger.info(f"[TRANSCRIPT] conversation_item_added - {role}: {content[:50]}...")
+                    praxa.on_transcript_update(role, content)
+                    praxa._logged_messages.add(message_id)
+            except Exception as e:
+                logger.error(f"[TRANSCRIPT] Error in conversation_item_added handler: {e}")
         
-        # Also capture interrupted speech (when call is hung up mid-sentence)
-        @session.on("agent_speech_interrupted")
-        def on_agent_interrupted(msg):
-            content = msg.content if hasattr(msg, 'content') else str(msg)
-            logger.info(f"[TRANSCRIPT DEBUG] EVENT: agent_speech_interrupted - {content[:50]}...")
-            praxa.on_transcript_update("assistant", f"{content} [interrupted]")
+        # Also listen to user_input_transcribed for user speech
+        @session.on("user_input_transcribed")  
+        def on_user_transcribed(transcription):
+            try:
+                content = transcription.text if hasattr(transcription, 'text') else str(transcription)
+                message_id = f"user:{content[:50]}"
+                if message_id not in praxa._logged_messages:
+                    print(f"[🎤 USER TRANSCRIBED] {content[:80]}...", flush=True)
+                    logger.info(f"[TRANSCRIPT] user_input_transcribed: {content[:50]}...")
+                    praxa.on_transcript_update("user", content)
+                    praxa._logged_messages.add(message_id)
+            except Exception as e:
+                logger.error(f"[TRANSCRIPT] Error in user_input_transcribed handler: {e}")
         
-        logger.info("[TRANSCRIPT DEBUG] Transcript event listeners set up successfully")
+        logger.info("[TRANSCRIPT DEBUG] Event listeners registered: conversation_item_added, user_input_transcribed")
+        print("[TRANSCRIPT DEBUG] Event listeners registered successfully", flush=True)
         
         # Start the session
         logger.info(f"Starting session with participant: {participant.identity}")
@@ -846,14 +860,50 @@ async def entrypoint(ctx: JobContext):
         await session.say(opening_msg, allow_interruptions=True)
         logger.info("Opening message sent!")
         
-        # Wait for the session to end
-        logger.info("Waiting for session to end...")
-        await session.wait()
-        logger.info("Session ended normally")
+        # The session is now running in the background managed by LiveKit
+        # We DON'T need to wait() - LiveKit handles the session lifecycle
+        # The session will stay active until the room disconnects
+        # Just like the working Praxa-voice-agent code!
+        logger.info("Session running - LiveKit managing lifecycle. Job complete!")
+        print("Session running - agent will remain active until room disconnect", flush=True)
         
     except Exception as e:
         logger.error(f"Error in agent session: {e}", exc_info=True)
     finally:
+        # Extract final transcript from session.history before ending
+        logger.info("Extracting final transcript from session...")
+        print("=" * 60, flush=True)
+        print("EXTRACTING FINAL TRANSCRIPT", flush=True)
+        print("=" * 60, flush=True)
+        
+        try:
+            # Try to get conversation history from session.history (LiveKit v1.0+ API)
+            if hasattr(session, 'history'):
+                history = session.history
+                logger.info(f"[TRANSCRIPT FINAL] Found session.history with {len(history)} items")
+                print(f"[TRANSCRIPT FINAL] session.history has {len(history)} items", flush=True)
+                
+                for item in history:
+                    role = item.role if hasattr(item, 'role') else 'assistant'
+                    content = item.content if hasattr(item, 'content') else str(item)
+                    
+                    # Only add if not already in transcript
+                    message_id = f"{role}:{content[:50]}"
+                    if not hasattr(praxa, '_logged_messages') or message_id not in praxa._logged_messages:
+                        print(f"[FINAL EXTRACT] {role}: {content[:80]}...", flush=True)
+                        praxa.on_transcript_update(role, content)
+                        if hasattr(praxa, '_logged_messages'):
+                            praxa._logged_messages.add(message_id)
+            else:
+                logger.warning("[TRANSCRIPT FINAL] session.history not available")
+                print("[TRANSCRIPT FINAL] session.history not available", flush=True)
+        except Exception as e:
+            logger.error(f"[TRANSCRIPT FINAL] Error extracting from session.history: {e}")
+            print(f"[TRANSCRIPT FINAL] Error: {e}", flush=True)
+        
+        print(f"[TRANSCRIPT FINAL] Total messages captured: {len(praxa.transcript)}", flush=True)
+        print("=" * 60, flush=True)
+        
         # ALWAYS call on_call_ended, even if there was an error
         logger.info("Calling on_call_ended...")
         try:
