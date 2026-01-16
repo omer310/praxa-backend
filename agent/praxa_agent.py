@@ -266,21 +266,45 @@ class PraxaAgent:
             ended_at = datetime.utcnow()
             duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
             
+            # CRITICAL DEBUG: Log transcript status (use print to bypass Railway log rate limits)
+            transcript_count = len(self.transcript)
+            print(f"\n{'='*60}", flush=True)
+            print(f"[TRANSCRIPT DEBUG] on_call_ended called - transcript has {transcript_count} messages", flush=True)
+            logger.info(f"[TRANSCRIPT DEBUG] on_call_ended called - transcript has {transcript_count} messages")
+            
+            if transcript_count > 0:
+                print(f"[TRANSCRIPT DEBUG] First message: {self.transcript[0]}", flush=True)
+                print(f"[TRANSCRIPT DEBUG] Last message: {self.transcript[-1]}", flush=True)
+                logger.info(f"[TRANSCRIPT DEBUG] First message: {self.transcript[0]}")
+                logger.info(f"[TRANSCRIPT DEBUG] Last message: {self.transcript[-1]}")
+            else:
+                print(f"[TRANSCRIPT DEBUG] WARNING: Transcript is EMPTY!", flush=True)
+                logger.warning(f"[TRANSCRIPT DEBUG] WARNING: Transcript is EMPTY!")
+            print(f"{'='*60}\n", flush=True)
+            
             # Generate summary using OpenAI
             summary = await self._generate_summary()
+            logger.info(f"[TRANSCRIPT DEBUG] Generated summary: {summary[:100]}...")
             
-            # Update call log
-            await self.db.update_call_log(self.call_log_id, {
+            # Prepare update data
+            update_data = {
                 "status": "completed",
                 "ended_at": ended_at.isoformat(),
                 "duration_seconds": duration,
-                "transcript": self.transcript,
+                "transcript": self.transcript,  # This is a list of dicts
                 "summary": summary,
                 "tasks_discussed": list(set(self.tasks_discussed)),
                 "tasks_completed": list(set(self.tasks_completed)),
                 "tasks_created": list(set(self.tasks_created)),
                 "goals_updated": self.goals_updated
-            })
+            }
+            
+            logger.info(f"[TRANSCRIPT DEBUG] About to update call_log {self.call_log_id} with {len(self.transcript)} transcript messages")
+            
+            # Update call log
+            result = await self.db.update_call_log(self.call_log_id, update_data)
+            
+            logger.info(f"[TRANSCRIPT DEBUG] Call log updated successfully. Result: {result.get('id', 'unknown')}")
             
             # Schedule next call
             if self.user_settings:
@@ -293,12 +317,13 @@ class PraxaAgent:
             
             logger.info(
                 f"Call ended for user {self.user_id}: "
-                f"{duration}s, {len(self.tasks_completed)} completed, "
+                f"{duration}s, {transcript_count} transcript messages, "
+                f"{len(self.tasks_completed)} completed, "
                 f"{len(self.tasks_created)} created"
             )
             
         except Exception as e:
-            logger.error(f"Error handling call end: {e}")
+            logger.error(f"Error handling call end: {e}", exc_info=True)
 
     async def _generate_summary(self) -> str:
         """Generate a summary of the call using OpenAI."""
@@ -336,11 +361,13 @@ Transcript:
 
     def on_transcript_update(self, role: str, content: str):
         """Called when there's new transcript content."""
-        self.transcript.append({
+        transcript_entry = {
             "role": role,
             "content": content,
             "timestamp": datetime.utcnow().isoformat()
-        })
+        }
+        self.transcript.append(transcript_entry)
+        logger.info(f"[TRANSCRIPT DEBUG] Added to transcript - {role}: {content[:50]}... (total: {len(self.transcript)} messages)")
 
     # Tool functions for the agent
     async def mark_task_complete(self, task_title: str) -> str:
@@ -771,15 +798,31 @@ async def entrypoint(ctx: JobContext):
         logger.info("AgentSession created successfully")
         
         # Track transcripts using session events
+        # Use both "committed" (finalized) and "interrupted" (cut off) events
+        logger.info("[TRANSCRIPT DEBUG] Setting up transcript event listeners...")
+        
         @session.on("user_speech_committed")
         def on_user_speech(msg):
-            praxa.on_transcript_update("user", msg.content if hasattr(msg, 'content') else str(msg))
-            logger.info(f"User said: {msg}")
+            content = msg.content if hasattr(msg, 'content') else str(msg)
+            print(f"[🎤 USER] {content[:80]}...", flush=True)
+            logger.info(f"[TRANSCRIPT DEBUG] EVENT: user_speech_committed - {content[:50]}...")
+            praxa.on_transcript_update("user", content)
         
         @session.on("agent_speech_committed") 
         def on_agent_speech(msg):
-            praxa.on_transcript_update("assistant", msg.content if hasattr(msg, 'content') else str(msg))
-            logger.info(f"Agent said: {msg}")
+            content = msg.content if hasattr(msg, 'content') else str(msg)
+            print(f"[🤖 AGENT] {content[:80]}...", flush=True)
+            logger.info(f"[TRANSCRIPT DEBUG] EVENT: agent_speech_committed - {content[:50]}...")
+            praxa.on_transcript_update("assistant", content)
+        
+        # Also capture interrupted speech (when call is hung up mid-sentence)
+        @session.on("agent_speech_interrupted")
+        def on_agent_interrupted(msg):
+            content = msg.content if hasattr(msg, 'content') else str(msg)
+            logger.info(f"[TRANSCRIPT DEBUG] EVENT: agent_speech_interrupted - {content[:50]}...")
+            praxa.on_transcript_update("assistant", f"{content} [interrupted]")
+        
+        logger.info("[TRANSCRIPT DEBUG] Transcript event listeners set up successfully")
         
         # Start the session
         logger.info(f"Starting session with participant: {participant.identity}")

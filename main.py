@@ -636,6 +636,17 @@ async def get_user_call_logs(user_id: str, limit: int = 10):
             "user_id", user_id
         ).order("created_at", desc=True).limit(limit).execute()
         
+        # Add debug info about transcripts
+        if response.data:
+            for log in response.data:
+                transcript = log.get("transcript")
+                if transcript:
+                    log["_transcript_debug"] = {
+                        "type": str(type(transcript)),
+                        "length": len(transcript) if isinstance(transcript, (list, dict, str)) else None,
+                        "is_empty": not bool(transcript)
+                    }
+        
         return {
             "count": len(response.data) if response.data else 0,
             "call_logs": response.data or []
@@ -643,6 +654,52 @@ async def get_user_call_logs(user_id: str, limit: int = 10):
     except Exception as e:
         logger.error(f"Error fetching call logs: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch call logs")
+
+
+@app.get("/call-log/{call_log_id}/debug")
+async def debug_call_log(call_log_id: str):
+    """
+    Debug endpoint to inspect a specific call log in detail.
+    
+    Args:
+        call_log_id: The UUID of the call log
+        
+    Returns:
+        Detailed call log information including transcript debug data
+    """
+    db = get_supabase_client()
+    
+    try:
+        response = db.client.table("call_logs").select("*").eq("id", call_log_id).single().execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Call log not found")
+        
+        call_log = response.data
+        transcript = call_log.get("transcript")
+        
+        # Detailed transcript analysis
+        debug_info = {
+            "transcript_exists": transcript is not None,
+            "transcript_type": str(type(transcript)),
+            "transcript_length": len(transcript) if isinstance(transcript, (list, dict, str)) else 0,
+            "transcript_is_empty": not bool(transcript),
+            "transcript_sample": transcript[:2] if isinstance(transcript, list) and len(transcript) > 0 else transcript,
+            "summary_exists": bool(call_log.get("summary")),
+            "status": call_log.get("status"),
+            "duration_seconds": call_log.get("duration_seconds"),
+            "tasks_completed_count": len(call_log.get("tasks_completed", [])),
+            "tasks_created_count": len(call_log.get("tasks_created", [])),
+        }
+        
+        return {
+            "call_log_id": call_log_id,
+            "debug_info": debug_info,
+            "full_call_log": call_log
+        }
+    except Exception as e:
+        logger.error(f"Error fetching call log debug: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch call log")
 
 
 # ==================== Run Server ====================
