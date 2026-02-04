@@ -265,8 +265,7 @@ class PraxaAgent:
         try:
             ended_at = datetime.utcnow()
             duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
-            
-            # CRITICAL DEBUG: Log transcript status (use print to bypass Railway log rate limits)
+        
             transcript_count = len(self.transcript)
             print(f"\n{'='*60}", flush=True)
             print(f"[TRANSCRIPT DEBUG] on_call_ended called - transcript has {transcript_count} messages", flush=True)
@@ -305,6 +304,22 @@ class PraxaAgent:
             result = await self.db.update_call_log(self.call_log_id, update_data)
             
             logger.info(f"[TRANSCRIPT DEBUG] Call log updated successfully. Result: {result.get('id', 'unknown')}")
+            
+            # Mark scheduled call as completed (PRODUCTION FIX: Link completion)
+            try:
+                scheduled_call_response = self.db.client.table("scheduled_calls").update({
+                    "status": "completed",
+                    "call_log_id": self.call_log_id,
+                    "updated_at": ended_at.isoformat()
+                }).eq("user_id", self.user_id).eq("status", "processing").execute()
+                
+                if scheduled_call_response.data:
+                    logger.info(f"✅ Marked scheduled_call as completed for user {self.user_id}")
+                else:
+                    logger.warning(f"No processing scheduled_call found to mark complete for user {self.user_id}")
+            except Exception as e:
+                logger.error(f"Failed to update scheduled_call status: {e}")
+                # Don't fail the call if this update fails
             
             # Schedule next call
             if self.user_settings:
@@ -806,10 +821,24 @@ async def entrypoint(ctx: JobContext):
         
         # Listen to conversation_item_added - the main event for conversation tracking
         @session.on("conversation_item_added")
-        def on_conversation_item(item):
+        def on_conversation_item(event):
             try:
+                # Extract the ChatMessage item from the event
+                item = event.item if hasattr(event, 'item') else event
+                
+                # Get role and content from the ChatMessage
                 role = item.role if hasattr(item, 'role') else 'assistant'
-                content = item.content if hasattr(item, 'content') else str(item)
+                
+                # Extract actual content - it's usually a list
+                if hasattr(item, 'content'):
+                    content_raw = item.content
+                    # If it's a list, join it
+                    if isinstance(content_raw, list):
+                        content = ' '.join(str(c) for c in content_raw)
+                    else:
+                        content = str(content_raw)
+                else:
+                    content = str(item)
                 
                 # Create unique ID to prevent duplicates
                 message_id = f"{role}:{content[:50]}"
@@ -819,21 +848,25 @@ async def entrypoint(ctx: JobContext):
                     praxa.on_transcript_update(role, content)
                     praxa._logged_messages.add(message_id)
             except Exception as e:
-                logger.error(f"[TRANSCRIPT] Error in conversation_item_added handler: {e}")
+                logger.error(f"[TRANSCRIPT] Error in conversation_item_added handler: {e}", exc_info=True)
+                print(f"[TRANSCRIPT ERROR] {e}", flush=True)
         
-        # Also listen to user_input_transcribed for user speech
+        # Also listen to user_input_transcribed for user speech (backup/additional capture)
         @session.on("user_input_transcribed")  
-        def on_user_transcribed(transcription):
+        def on_user_transcribed(event):
             try:
-                content = transcription.text if hasattr(transcription, 'text') else str(transcription)
-                message_id = f"user:{content[:50]}"
+                # Extract transcript text from the event
+                transcript = event.transcript if hasattr(event, 'transcript') else str(event)
+                
+                message_id = f"user:{transcript[:50]}"
                 if message_id not in praxa._logged_messages:
-                    print(f"[🎤 USER TRANSCRIBED] {content[:80]}...", flush=True)
-                    logger.info(f"[TRANSCRIPT] user_input_transcribed: {content[:50]}...")
-                    praxa.on_transcript_update("user", content)
+                    print(f"[🎤 USER TRANSCRIBED] {transcript[:80]}...", flush=True)
+                    logger.info(f"[TRANSCRIPT] user_input_transcribed: {transcript[:50]}...")
+                    praxa.on_transcript_update("user", transcript)
                     praxa._logged_messages.add(message_id)
             except Exception as e:
-                logger.error(f"[TRANSCRIPT] Error in user_input_transcribed handler: {e}")
+                logger.error(f"[TRANSCRIPT] Error in user_input_transcribed handler: {e}", exc_info=True)
+                print(f"[TRANSCRIPT ERROR] {e}", flush=True)
         
         logger.info("[TRANSCRIPT DEBUG] Event listeners registered: conversation_item_added, user_input_transcribed")
         print("[TRANSCRIPT DEBUG] Event listeners registered successfully", flush=True)
@@ -860,12 +893,36 @@ async def entrypoint(ctx: JobContext):
         await session.say(opening_msg, allow_interruptions=True)
         logger.info("Opening message sent!")
         
-        # The session is now running in the background managed by LiveKit
-        # We DON'T need to wait() - LiveKit handles the session lifecycle
-        # The session will stay active until the room disconnects
-        # Just like the working Praxa-voice-agent code!
-        logger.info("Session running - LiveKit managing lifecycle. Job complete!")
-        print("Session running - agent will remain active until room disconnect", flush=True)
+        # The session is now running - but we need to keep this function alive
+        # Otherwise the finally block will execute and end the call prematurely!
+        logger.info("Session running - monitoring for disconnect...")
+        print("Session running - monitoring for disconnect...", flush=True)
+        
+        # Keep the function alive until the room disconnects or participant leaves
+        # This is different from the other voice agent because that one uses a different pattern
+        while True:
+            await asyncio.sleep(1)
+            
+            # Check if room is disconnected
+            if ctx.room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
+                logger.info("Room disconnected - ending session")
+                print("Room disconnected - ending session", flush=True)
+                break
+            
+            # Check if phone participant is still there
+            phone_connected = False
+            for participant_id, participant in ctx.room.remote_participants.items():
+                if participant.identity == "phone-user":
+                    phone_connected = True
+                    break
+            
+            if not phone_connected and len(ctx.room.remote_participants) == 0:
+                logger.info("No participants in room - ending session")  
+                print("No participants in room - ending session", flush=True)
+                break
+        
+        logger.info("Session monitoring complete - proceeding to cleanup")
+        print("Session monitoring complete - proceeding to cleanup", flush=True)
         
     except Exception as e:
         logger.error(f"Error in agent session: {e}", exc_info=True)
@@ -880,12 +937,24 @@ async def entrypoint(ctx: JobContext):
             # Try to get conversation history from session.history (LiveKit v1.0+ API)
             if hasattr(session, 'history'):
                 history = session.history
-                logger.info(f"[TRANSCRIPT FINAL] Found session.history with {len(history)} items")
-                print(f"[TRANSCRIPT FINAL] session.history has {len(history)} items", flush=True)
+                # ChatContext is iterable but doesn't have len()
+                history_items = list(history) if history else []
+                logger.info(f"[TRANSCRIPT FINAL] Found session.history with {len(history_items)} items")
+                print(f"[TRANSCRIPT FINAL] session.history has {len(history_items)} items", flush=True)
                 
-                for item in history:
+                for item in history_items:
                     role = item.role if hasattr(item, 'role') else 'assistant'
-                    content = item.content if hasattr(item, 'content') else str(item)
+                    
+                    # Extract actual content - it's usually a list
+                    if hasattr(item, 'content'):
+                        content_raw = item.content
+                        # If it's a list, join it
+                        if isinstance(content_raw, list):
+                            content = ' '.join(str(c) for c in content_raw)
+                        else:
+                            content = str(content_raw)
+                    else:
+                        content = str(item)
                     
                     # Only add if not already in transcript
                     message_id = f"{role}:{content[:50]}"
@@ -898,7 +967,7 @@ async def entrypoint(ctx: JobContext):
                 logger.warning("[TRANSCRIPT FINAL] session.history not available")
                 print("[TRANSCRIPT FINAL] session.history not available", flush=True)
         except Exception as e:
-            logger.error(f"[TRANSCRIPT FINAL] Error extracting from session.history: {e}")
+            logger.error(f"[TRANSCRIPT FINAL] Error extracting from session.history: {e}", exc_info=True)
             print(f"[TRANSCRIPT FINAL] Error: {e}", flush=True)
         
         print(f"[TRANSCRIPT FINAL] Total messages captured: {len(praxa.transcript)}", flush=True)

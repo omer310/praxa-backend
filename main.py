@@ -542,11 +542,11 @@ async def sync_scheduled_calls(
 ):
     """
     Sync scheduled calls for a user based on their current checkin_schedule.
-    This should be called when the user updates their schedule in the app.
     
-    It will:
-    1. Cancel all pending scheduled calls for this user
-    2. Create new scheduled calls based on the current checkin_schedule
+    PRODUCTION OPTIMIZATION:
+    - Uses schedule hash to detect actual changes (idempotency)
+    - Only cancels/recreates if schedule truly changed
+    - Prevents unnecessary database churn (was 83% cancellation rate)
     
     **Requires Authentication**: Supabase JWT token in Authorization header
     
@@ -555,8 +555,10 @@ async def sync_scheduled_calls(
         auth: Authenticated user info from JWT token (dependency)
         
     Returns:
-        List of newly created scheduled calls
+        List of scheduled calls (created or unchanged)
     """
+    import hashlib
+    
     authenticated_user_id = auth["user_id"]
     
     # Security: Only allow users to sync their own calls
@@ -580,6 +582,38 @@ async def sync_scheduled_calls(
         timezone_str = settings.get("timezone", "America/New_York")
         checkin_enabled = settings.get("checkin_enabled", True)
         
+        # Compute hash of current schedule for idempotency
+        schedule_data = {
+            "schedule": sorted([
+                {"day": item.get("day"), "time": item.get("time")}
+                for item in checkin_schedule
+            ], key=lambda x: (x["day"], x["time"])),
+            "timezone": timezone_str,
+            "enabled": checkin_enabled
+        }
+        current_hash = hashlib.md5(
+            json.dumps(schedule_data, sort_keys=True).encode()
+        ).hexdigest()
+        
+        # Get stored hash
+        stored_hash = settings.get("checkin_schedule_hash")
+        
+        # IDEMPOTENCY CHECK: If hash matches, schedule hasn't changed
+        if stored_hash == current_hash and checkin_enabled:
+            logger.info(f"Schedule unchanged for user {user_id} (hash: {current_hash[:8]}...), skipping sync")
+            
+            # Return existing pending calls
+            existing_calls = db.client.table("scheduled_calls").select("*").eq(
+                "user_id", user_id
+            ).eq("status", "pending").execute()
+            
+            return {
+                "success": True,
+                "scheduled_calls": existing_calls.data or [],
+                "count": len(existing_calls.data or []),
+                "message": "Schedule unchanged, no sync needed"
+            }
+        
         if not checkin_enabled or not checkin_schedule:
             # Cancel all pending calls if checkin is disabled or no schedule
             db.client.table("scheduled_calls").update({
@@ -587,19 +621,24 @@ async def sync_scheduled_calls(
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("user_id", user_id).eq("status", "pending").execute()
             
+            # Update hash
+            db.client.table("user_settings").update({
+                "checkin_schedule_hash": current_hash,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("user_id", user_id).execute()
+            
             logger.info(f"Cancelled all pending calls for user {user_id} (checkin disabled or no schedule)")
             return {"success": True, "scheduled_calls": [], "count": 0}
         
-        # Cancel all old pending calls and create fresh ones
-        # This ensures we always have the correct set of calls matching the current schedule
+        # Schedule changed - cancel old and create new
+        logger.info(f"Schedule changed for user {user_id} (old: {stored_hash[:8] if stored_hash else 'none'}... new: {current_hash[:8]}...)")
+        
         db.client.table("scheduled_calls").update({
             "status": "cancelled",
             "updated_at": datetime.utcnow().isoformat()
         }).eq("user_id", user_id).eq("status", "pending").execute()
         
-        logger.info(f"Cancelled all pending scheduled calls for user {user_id}")
-        
-        # Create new scheduled calls for ALL days in the schedule
+        # Create new scheduled calls
         created_calls = await db.create_all_scheduled_calls(
             user_id=user_id,
             checkin_schedule=checkin_schedule,
@@ -607,10 +646,19 @@ async def sync_scheduled_calls(
             checkin_enabled=checkin_enabled
         )
         
+        # Store new hash
+        db.client.table("user_settings").update({
+            "checkin_schedule_hash": current_hash,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("user_id", user_id).execute()
+        
+        logger.info(f"✅ Synced schedule for user {user_id}: {len(created_calls)} calls created")
+        
         return {
             "success": True,
             "scheduled_calls": created_calls,
-            "count": len(created_calls)
+            "count": len(created_calls),
+            "message": "Schedule updated successfully"
         }
     except Exception as e:
         logger.error(f"Error syncing scheduled calls: {e}")
