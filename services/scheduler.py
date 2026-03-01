@@ -10,6 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .supabase_client import get_supabase_client
+from .push_service import send_push_notification, get_user_push_token, schedule_receipt_check
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,19 @@ class CallScheduler:
                 await db.update_scheduled_call(call_id, {"status": "skipped"})
                 return
             
+            # Only send push on the first attempt — not on retries
+            if attempt_count == 0:
+                push_token = await get_user_push_token(user_id)
+                if push_token:
+                    ticket_id = await send_push_notification(
+                        push_token=push_token,
+                        title="Check-in Call Coming Up",
+                        body="Your Praxa check-in is starting now. Get ready!",
+                        data={"notificationType": "call_reminder"},
+                    )
+                    if ticket_id:
+                        schedule_receipt_check(ticket_id, user_id)
+
             # Trigger the call
             logger.info(f"Triggering call for user {user_id}")
             result = await self.trigger_callback(user_id)

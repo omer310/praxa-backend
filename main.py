@@ -34,6 +34,7 @@ from models.schemas import (
 )
 from services.supabase_client import get_supabase_client, SupabaseClient
 from services.scheduler import get_call_scheduler, CallScheduler
+from services.push_service import send_push_notification, get_user_push_token, schedule_receipt_check
 
 # Load environment variables
 load_dotenv()
@@ -463,6 +464,31 @@ async def twilio_webhook(request: Request):
             
             await db.update_call_log(call_log["id"], updates)
             logger.info(f"Updated call log {call_log['id']} to status {our_status}")
+
+            # Send push notification for terminal statuses
+            user_id = call_log.get("user_id")
+            if user_id and our_status in [
+                CallStatus.COMPLETED, CallStatus.FAILED,
+                CallStatus.NO_ANSWER, CallStatus.BUSY, CallStatus.CANCELED,
+            ]:
+                push_token = await get_user_push_token(user_id)
+                if push_token:
+                    if our_status == CallStatus.COMPLETED:
+                        ticket_id = await send_push_notification(
+                            push_token=push_token,
+                            title="Great Work",
+                            body="Check-in done. You're on track",
+                            data={"notificationType": "call_completed"},
+                        )
+                    else:
+                        ticket_id = await send_push_notification(
+                            push_token=push_token,
+                            title="We Missed You",
+                            body="No worries! Open Praxa to adjust your check-in time",
+                            data={"notificationType": "call_missed"},
+                        )
+                    if ticket_id:
+                        schedule_receipt_check(ticket_id, user_id)
         else:
             logger.warning(f"No call log found for SID: {call_sid}")
         

@@ -55,7 +55,10 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
 
 from services.supabase_client import get_supabase_client
-from agent.prompts import SYSTEM_PROMPT, get_user_context_prompt, get_opening_message, get_closing_message
+from agent.prompts import (
+    SYSTEM_PROMPT, IN_APP_SYSTEM_PROMPT,
+    get_user_context_prompt, get_opening_message, get_in_app_opening_message, get_closing_message,
+)
 
 # For calendar access
 import httpx
@@ -78,10 +81,19 @@ class PraxaAgent:
     5. Can take actions like marking tasks complete, adding notes, creating tasks
     """
 
-    def __init__(self, user_id: str, call_log_id: str, calendar_grant_id: Optional[str] = None):
+    def __init__(
+        self,
+        user_id: str,
+        call_log_id: Optional[str] = None,
+        calendar_grant_id: Optional[str] = None,
+        email_grant_id: Optional[str] = None,
+        is_in_app: bool = False,
+    ):
         self.user_id = user_id
         self.call_log_id = call_log_id
         self.calendar_grant_id = calendar_grant_id
+        self.email_grant_id = email_grant_id
+        self.is_in_app = is_in_app
         self.db = get_supabase_client()
         
         # Call tracking
@@ -215,11 +227,18 @@ class PraxaAgent:
             calendar_busy_count=self.calendar_busy_count
         )
         
-        return f"{SYSTEM_PROMPT}\n\n--- USER CONTEXT ---\n{context_prompt}"
+        base_prompt = IN_APP_SYSTEM_PROMPT if self.is_in_app else SYSTEM_PROMPT
+        return f"{base_prompt}\n\n--- USER CONTEXT ---\n{context_prompt}"
 
     def _get_opening_message(self) -> str:
-        """Get the opening message for the call."""
+        """Get the opening message."""
         user_name = self.user_context.get("name") if self.user_context else None
+        if self.is_in_app:
+            return get_in_app_opening_message(
+                user_name=user_name,
+                this_week_count=len(self.this_week_tasks),
+                overdue_count=len(self.overdue_tasks),
+            )
         return get_opening_message(
             user_name=user_name,
             this_week_count=len(self.this_week_tasks),
@@ -262,6 +281,10 @@ class PraxaAgent:
 
     async def on_call_ended(self):
         """Called when the call ends."""
+        if self.is_in_app or not self.call_log_id:
+            logger.info("In-app session ended — skipping call log update")
+            return
+
         try:
             ended_at = datetime.utcnow()
             duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
@@ -670,114 +693,136 @@ async def entrypoint(ctx: JobContext):
     print(f"Connected to room: {room_name}", flush=True)
     logger.info(f"Agent connected to room: {room_name}")
     
-    # NOW parse room metadata (available after connection)
+    # Parse metadata — phone calls set room metadata; in-app dispatches set job metadata.
+    # Support both snake_case (phone calls) and camelCase (in-app token server) key formats.
     try:
-        # Access metadata from the connected room
-        room_metadata = ctx.room.metadata
-        print(f"Room metadata: {room_metadata}", flush=True)
-        logger.info(f"Room metadata: {room_metadata}")
-        
-        metadata = json.loads(room_metadata) if room_metadata else {}
-        user_id = metadata.get("user_id")
-        call_log_id = metadata.get("call_log_id")
-        phone_number = metadata.get("phone_number")
-        calendar_grant_id = metadata.get("calendar_grant_id")
-        
-        # Fallback to parsing room name if metadata is missing
+        room_metadata_str = ctx.room.metadata or ""
+        job_metadata_str = ""
+        if hasattr(ctx, 'job') and ctx.job and hasattr(ctx.job, 'metadata'):
+            job_metadata_str = ctx.job.metadata or ""
+
+        print(f"Room metadata: {room_metadata_str!r}", flush=True)
+        print(f"Job metadata:  {job_metadata_str!r}", flush=True)
+        logger.info(f"Room metadata: {room_metadata_str!r} | Job metadata: {job_metadata_str!r}")
+
+        # Prefer room metadata (phone calls), fall back to job metadata (in-app)
+        metadata: dict = {}
+        if room_metadata_str:
+            metadata = json.loads(room_metadata_str)
+        elif job_metadata_str:
+            metadata = json.loads(job_metadata_str)
+
+        # Support both snake_case and camelCase key names
+        def _get(snake: str, camel: str) -> Optional[str]:
+            return metadata.get(snake) or metadata.get(camel) or None
+
+        user_id        = _get("user_id", "userId")
+        call_log_id    = _get("call_log_id", "callLogId")
+        phone_number   = _get("phone_number", "phoneNumber")
+        calendar_grant_id = _get("calendar_grant_id", "calendarGrantId")
+        email_grant_id = _get("email_grant_id", "emailGrantId")
+
+        # Fallback: parse room name for phone call rooms (praxa-call-{user_id}-{call_log_id})
         if not user_id:
             parts = room_name.split("-")
             if len(parts) >= 4 and parts[0] == "praxa" and parts[1] == "call":
                 user_id = parts[2]
                 call_log_id = parts[3] if len(parts) > 3 else None
-        
+
         if not user_id:
-            logger.error(f"Could not get user_id from room: {room_name}")
+            logger.error(f"Could not determine user_id from room '{room_name}' or metadata")
             return
-            
-        if not phone_number:
-            logger.error(f"No phone_number in room metadata: {room_name}, metadata was: {room_metadata}")
-            return
-        
-        # Log calendar availability
+
+        is_in_app = not bool(phone_number)
+
+        print(f"Mode: {'IN-APP' if is_in_app else 'PHONE CALL'}", flush=True)
+        print(f"user_id={user_id} | call_log_id={call_log_id} | phone_number={phone_number}", flush=True)
+        logger.info(f"Agent mode: {'in-app' if is_in_app else 'phone'} | user_id={user_id}")
+
         if calendar_grant_id:
-            print(f"Calendar grant ID available: {calendar_grant_id[:20]}...", flush=True)
-            logger.info(f"Calendar grant ID available for user {user_id}")
-        else:
-            print("No calendar grant ID - calendar features will be unavailable", flush=True)
-            logger.info("No calendar grant ID - agent will skip calendar features")
-            
+            logger.info(f"Calendar grant available: {calendar_grant_id[:20]}...")
+        if email_grant_id:
+            logger.info(f"Email grant available: {email_grant_id[:20]}...")
+
     except Exception as e:
-        logger.error(f"Error parsing room metadata: {e}")
+        logger.error(f"Error parsing metadata: {e}", exc_info=True)
         return
-    
-    # Create the Praxa agent instance with calendar access if available
-    praxa = PraxaAgent(user_id=user_id, call_log_id=call_log_id or "unknown", calendar_grant_id=calendar_grant_id)
+
+    praxa = PraxaAgent(
+        user_id=user_id,
+        call_log_id=call_log_id,
+        calendar_grant_id=calendar_grant_id,
+        email_grant_id=email_grant_id,
+        is_in_app=is_in_app,
+    )
     _current_agent = praxa
     
     # Load user context
     await praxa.load_user_context()
     
-    # Dial out to the phone number via SIP
+    # Phone call mode: dial out via SIP. In-app mode: user is already in the room.
     participant = None
-    try:
-        print(f"LIVEKIT_SIP_TRUNK_ID = {LIVEKIT_SIP_TRUNK_ID}", flush=True)
-        
-        if not LIVEKIT_SIP_TRUNK_ID:
-            print("ERROR: LIVEKIT_SIP_TRUNK_ID not configured!", flush=True)
-            logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
-            logger.error("Please configure a SIP trunk in LiveKit Cloud: https://cloud.livekit.io")
-            return
-        
-        print(f"Dialing out to {phone_number} via SIP...", flush=True)
-        logger.info(f"Dialing out to {phone_number} via SIP...")
-        
-        lk_api = livekit_api.LiveKitAPI(
-            LIVEKIT_URL,
-            LIVEKIT_API_KEY,
-            LIVEKIT_API_SECRET
-        )
-        
-        # Create SIP participant (dial out)
-        sip_response = await lk_api.sip.create_sip_participant(
-            livekit_api.CreateSIPParticipantRequest(
-                sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
-                sip_call_to=phone_number,
-                room_name=room_name,
-                participant_identity="phone-user",
-                participant_name="Phone User",
-                play_ringtone=True,
+    if not is_in_app:
+        try:
+            print(f"LIVEKIT_SIP_TRUNK_ID = {LIVEKIT_SIP_TRUNK_ID}", flush=True)
+
+            if not LIVEKIT_SIP_TRUNK_ID:
+                print("ERROR: LIVEKIT_SIP_TRUNK_ID not configured!", flush=True)
+                logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
+                return
+
+            print(f"Dialing out to {phone_number} via SIP...", flush=True)
+            logger.info(f"Dialing out to {phone_number} via SIP...")
+
+            lk_api = livekit_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+
+            sip_response = await lk_api.sip.create_sip_participant(
+                livekit_api.CreateSIPParticipantRequest(
+                    sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
+                    sip_call_to=phone_number,
+                    room_name=room_name,
+                    participant_identity="phone-user",
+                    participant_name="Phone User",
+                    play_ringtone=True,
+                )
             )
-        )
-        
-        await lk_api.aclose()
-        
-        logger.info(f"SIP call initiated to {phone_number}")
-        
-        # Update call log
-        if call_log_id:
-            await praxa.db.update_call_log(call_log_id, {
-                "status": "ringing",
-                "call_sid": sip_response.sip_call_id if sip_response else None
-            })
-        
-        # Wait for the phone participant to connect
-        print("Waiting for phone participant to connect...", flush=True)
-        participant = await ctx.wait_for_participant()
-        print(f"Phone participant connected: {participant.identity}", flush=True)
-        logger.info(f"Phone participant connected: {participant.identity}")
-        
-    except Exception as e:
-        logger.error(f"Failed to dial out via SIP: {e}")
-        if call_log_id:
-            await praxa.db.update_call_log(call_log_id, {
-                "status": "failed",
-                "failure_reason": f"SIP dial failed: {str(e)}"
-            })
-        return
-    
-    # Mark call as started
-    await praxa.on_call_started()
-    logger.info("Call marked as started, creating agent session...")
+
+            await lk_api.aclose()
+            logger.info(f"SIP call initiated to {phone_number}")
+
+            if call_log_id:
+                await praxa.db.update_call_log(call_log_id, {
+                    "status": "ringing",
+                    "call_sid": sip_response.sip_call_id if sip_response else None
+                })
+
+            print("Waiting for phone participant to connect...", flush=True)
+            participant = await ctx.wait_for_participant()
+            print(f"Phone participant connected: {participant.identity}", flush=True)
+            logger.info(f"Phone participant connected: {participant.identity}")
+
+        except Exception as e:
+            logger.error(f"Failed to dial out via SIP: {e}")
+            if call_log_id:
+                await praxa.db.update_call_log(call_log_id, {
+                    "status": "failed",
+                    "failure_reason": f"SIP dial failed: {str(e)}"
+                })
+            return
+
+        await praxa.on_call_started()
+        logger.info("Phone call marked as started, creating agent session...")
+    else:
+        print("In-app mode — waiting for user participant...", flush=True)
+        logger.info("In-app mode — waiting for user participant in room")
+        try:
+            participant = await ctx.wait_for_participant()
+            print(f"User participant ready: {participant.identity}", flush=True)
+            logger.info(f"In-app user participant: {participant.identity}")
+        except Exception as e:
+            logger.error(f"Failed to get in-app participant: {e}")
+            return
+        logger.info("In-app session ready, creating agent session...")
     
     try:
         # Initialize voice pipeline components
@@ -819,53 +864,69 @@ async def entrypoint(ctx: JobContext):
         # Track logged messages to avoid duplicates
         praxa._logged_messages = set()
         
-        # Listen to conversation_item_added - the main event for conversation tracking
+        # Listen to user_input_transcribed for user speech — only capture final transcriptions
+        @session.on("user_input_transcribed")
+        def on_user_transcribed(event):
+            try:
+                is_final = event.is_final if hasattr(event, 'is_final') else True
+                if not is_final:
+                    return
+
+                transcript = event.transcript if hasattr(event, 'transcript') else str(event)
+                if not transcript or not transcript.strip():
+                    return
+
+                message_id = f"user:{transcript[:50]}"
+                if message_id not in praxa._logged_messages:
+                    print(f"[🎤 USER] {transcript[:80]}", flush=True)
+                    logger.info(f"[TRANSCRIPT] user said: {transcript[:80]}")
+                    praxa.on_transcript_update("user", transcript.strip())
+                    praxa._logged_messages.add(message_id)
+            except Exception as e:
+                logger.error(f"[TRANSCRIPT] Error in user_input_transcribed handler: {e}", exc_info=True)
+                print(f"[TRANSCRIPT ERROR] {e}", flush=True)
+
+        # Listen to conversation_item_added for agent responses
         @session.on("conversation_item_added")
         def on_conversation_item(event):
             try:
-                # Extract the ChatMessage item from the event
                 item = event.item if hasattr(event, 'item') else event
-                
-                # Get role and content from the ChatMessage
                 role = item.role if hasattr(item, 'role') else 'assistant'
-                
-                # Extract actual content - it's usually a list
-                if hasattr(item, 'content'):
+
+                # Skip user items — captured more accurately via user_input_transcribed
+                if role == 'user':
+                    return
+
+                # Use text_content if available (LiveKit v1.0+ convenience property)
+                if hasattr(item, 'text_content') and item.text_content:
+                    content = item.text_content
+                elif hasattr(item, 'content'):
                     content_raw = item.content
-                    # If it's a list, join it
                     if isinstance(content_raw, list):
-                        content = ' '.join(str(c) for c in content_raw)
+                        parts = []
+                        for c in content_raw:
+                            # AudioContent has a .transcript property with the actual text
+                            if hasattr(c, 'transcript') and c.transcript:
+                                parts.append(c.transcript)
+                            elif isinstance(c, str):
+                                parts.append(c)
+                        content = ' '.join(parts)
                     else:
                         content = str(content_raw)
                 else:
                     content = str(item)
-                
-                # Create unique ID to prevent duplicates
+
+                if not content or not content.strip():
+                    return
+
                 message_id = f"{role}:{content[:50]}"
                 if message_id not in praxa._logged_messages:
-                    print(f"[{'🎤 USER' if role == 'user' else '🤖 AGENT'}] {content[:80]}...", flush=True)
-                    logger.info(f"[TRANSCRIPT] conversation_item_added - {role}: {content[:50]}...")
-                    praxa.on_transcript_update(role, content)
+                    print(f"[🤖 AGENT] {content[:80]}", flush=True)
+                    logger.info(f"[TRANSCRIPT] agent said: {content[:80]}")
+                    praxa.on_transcript_update(role, content.strip())
                     praxa._logged_messages.add(message_id)
             except Exception as e:
                 logger.error(f"[TRANSCRIPT] Error in conversation_item_added handler: {e}", exc_info=True)
-                print(f"[TRANSCRIPT ERROR] {e}", flush=True)
-        
-        # Also listen to user_input_transcribed for user speech (backup/additional capture)
-        @session.on("user_input_transcribed")  
-        def on_user_transcribed(event):
-            try:
-                # Extract transcript text from the event
-                transcript = event.transcript if hasattr(event, 'transcript') else str(event)
-                
-                message_id = f"user:{transcript[:50]}"
-                if message_id not in praxa._logged_messages:
-                    print(f"[🎤 USER TRANSCRIBED] {transcript[:80]}...", flush=True)
-                    logger.info(f"[TRANSCRIPT] user_input_transcribed: {transcript[:50]}...")
-                    praxa.on_transcript_update("user", transcript)
-                    praxa._logged_messages.add(message_id)
-            except Exception as e:
-                logger.error(f"[TRANSCRIPT] Error in user_input_transcribed handler: {e}", exc_info=True)
                 print(f"[TRANSCRIPT ERROR] {e}", flush=True)
         
         logger.info("[TRANSCRIPT DEBUG] Event listeners registered: conversation_item_added, user_input_transcribed")
@@ -944,23 +1005,32 @@ async def entrypoint(ctx: JobContext):
                 
                 for item in history_items:
                     role = item.role if hasattr(item, 'role') else 'assistant'
-                    
-                    # Extract actual content - it's usually a list
-                    if hasattr(item, 'content'):
+
+                    # Use text_content if available (LiveKit v1.0+ convenience property)
+                    if hasattr(item, 'text_content') and item.text_content:
+                        content = item.text_content
+                    elif hasattr(item, 'content'):
                         content_raw = item.content
-                        # If it's a list, join it
                         if isinstance(content_raw, list):
-                            content = ' '.join(str(c) for c in content_raw)
+                            parts = []
+                            for c in content_raw:
+                                if hasattr(c, 'transcript') and c.transcript:
+                                    parts.append(c.transcript)
+                                elif isinstance(c, str):
+                                    parts.append(c)
+                            content = ' '.join(parts)
                         else:
                             content = str(content_raw)
                     else:
                         content = str(item)
-                    
-                    # Only add if not already in transcript
+
+                    if not content or not content.strip():
+                        continue
+
                     message_id = f"{role}:{content[:50]}"
                     if not hasattr(praxa, '_logged_messages') or message_id not in praxa._logged_messages:
-                        print(f"[FINAL EXTRACT] {role}: {content[:80]}...", flush=True)
-                        praxa.on_transcript_update(role, content)
+                        print(f"[FINAL EXTRACT] {role}: {content[:80]}", flush=True)
+                        praxa.on_transcript_update(role, content.strip())
                         if hasattr(praxa, '_logged_messages'):
                             praxa._logged_messages.add(message_id)
             else:

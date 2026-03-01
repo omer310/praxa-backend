@@ -1,12 +1,6 @@
 """
 Twilio/LiveKit SIP service for initiating outbound phone calls.
 
-NOTE: For LiveKit Agents, outbound calls are made through LiveKit's SIP infrastructure,
-not by calling Twilio directly. You need to:
-1. Configure a SIP Trunk in LiveKit Cloud connected to Twilio
-2. Use the LiveKit SIP Participant API to dial out
-
-See: https://docs.livekit.io/agents/quickstarts/outbound-calls/
 """
 
 import os
@@ -73,9 +67,6 @@ class SIPCallService:
     ) -> Optional[str]:
         """
         Dial a phone number and connect them to a LiveKit room via SIP.
-        
-        This uses LiveKit's SIP Participant API to initiate an outbound call.
-        Requires a SIP trunk configured in LiveKit Cloud.
         
         Args:
             room_name: The LiveKit room to connect the call to
