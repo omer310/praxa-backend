@@ -776,6 +776,48 @@ async def debug_call_log(call_log_id: str):
         raise HTTPException(status_code=500, detail="Failed to fetch call log")
 
 
+# ==================== Memory Endpoints ====================
+
+from pydantic import BaseModel as PydanticBase
+
+class SaveSessionMemoryRequest(PydanticBase):
+    user_id: str
+    surface: str
+    transcript: list | str
+    summary: str = ""
+    duration_seconds: int = 0
+    session_id: Optional[str] = None
+
+
+@app.post("/save-session-memory")
+async def save_session_memory(
+    request_body: SaveSessionMemoryRequest,
+    background_tasks: BackgroundTasks,
+    req: Request,
+):
+    """
+    Save a session's memory (transcript + extracted facts) after it ends.
+    Called by PraxaPanel on voice disconnect and by praxa-chat edge function.
+    """
+    try:
+        from services.memory_service import extract_and_store_session_memory
+
+        background_tasks.add_task(
+            extract_and_store_session_memory,
+            user_id=request_body.user_id,
+            surface=request_body.surface,
+            transcript=request_body.transcript,
+            summary=request_body.summary,
+            duration=request_body.duration_seconds,
+            session_id=request_body.session_id,
+        )
+
+        return {"status": "queued", "user_id": request_body.user_id}
+    except Exception as e:
+        logger.error(f"Error queuing session memory: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save session memory")
+
+
 # ==================== Run Server ====================
 
 if __name__ == "__main__":

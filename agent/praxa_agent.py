@@ -55,6 +55,7 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
 
 from services.supabase_client import get_supabase_client
+from services.memory_service import extract_and_store_session_memory, load_session_context
 from agent.prompts import (
     SYSTEM_PROMPT, IN_APP_SYSTEM_PROMPT,
     get_user_context_prompt, get_opening_message, get_in_app_opening_message, get_closing_message,
@@ -115,6 +116,9 @@ class PraxaAgent:
         # Calendar context (loaded if grant ID available)
         self.calendar_events: list[dict] = []
         self.calendar_busy_count: int = 0
+        
+        # Memory context (loaded at session start)
+        self.session_context: str = ""
 
     async def load_user_context(self):
         """Load all user data needed for the conversation."""
@@ -138,6 +142,13 @@ class PraxaAgent:
             
             # Get recently completed
             self.recently_completed = await self.db.get_recently_completed_tasks(self.user_id)
+            
+            # Load memory context
+            try:
+                self.session_context = await load_session_context(self.user_id)
+            except Exception as e:
+                logger.warning(f"Could not load memory context: {e}")
+                self.session_context = ""
             
             # Load calendar if grant ID available
             if self.calendar_grant_id:
@@ -228,7 +239,8 @@ class PraxaAgent:
         )
         
         base_prompt = IN_APP_SYSTEM_PROMPT if self.is_in_app else SYSTEM_PROMPT
-        return f"{base_prompt}\n\n--- USER CONTEXT ---\n{context_prompt}"
+        memory_section = f"\n\n{self.session_context}" if self.session_context else ""
+        return f"{base_prompt}\n\n--- USER CONTEXT ---\n{context_prompt}{memory_section}"
 
     def _get_opening_message(self) -> str:
         """Get the opening message."""
@@ -282,7 +294,20 @@ class PraxaAgent:
     async def on_call_ended(self):
         """Called when the call ends."""
         if self.is_in_app or not self.call_log_id:
-            logger.info("In-app session ended — skipping call log update")
+            logger.info("In-app session ended — saving memory only")
+            if self.transcript and self.user_id:
+                try:
+                    ended_at = datetime.utcnow()
+                    duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
+                    await extract_and_store_session_memory(
+                        user_id=self.user_id,
+                        surface="voice",
+                        transcript=self.transcript,
+                        summary="",
+                        duration=duration,
+                    )
+                except Exception as e:
+                    logger.error(f"Error saving in-app session memory: {e}")
             return
 
         try:
@@ -358,6 +383,18 @@ class PraxaAgent:
                 f"{duration}s, {transcript_count} transcript messages, "
                 f"{len(self.tasks_completed)} completed, "
                 f"{len(self.tasks_created)} created"
+            )
+
+            # Extract and store session memory (non-blocking)
+            asyncio.create_task(
+                extract_and_store_session_memory(
+                    user_id=self.user_id,
+                    surface="phone",
+                    transcript=self.transcript,
+                    summary=summary,
+                    duration=duration,
+                    session_id=self.call_log_id,
+                )
             )
             
         except Exception as e:

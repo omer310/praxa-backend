@@ -191,10 +191,30 @@ class CallScheduler:
             name="Check and trigger scheduled calls",
             replace_existing=True
         )
+
+        # Add daily memory consolidation at 3am UTC
+        from apscheduler.triggers.cron import CronTrigger
+        self.scheduler.add_job(
+            self._run_memory_consolidation,
+            trigger=CronTrigger(hour=3, minute=0),
+            id="consolidate_memories",
+            name="Nightly memory consolidation",
+            replace_existing=True,
+        )
         
         self.scheduler.start()
         self._running = True
         logger.info("Call scheduler started (checking every 5 minutes)")
+
+    async def _run_memory_consolidation(self):
+        """Run nightly memory consolidation for all users."""
+        try:
+            from services.memory_service import consolidate_all_users_memories
+            logger.info("[Scheduler] Starting nightly memory consolidation")
+            await consolidate_all_users_memories()
+            logger.info("[Scheduler] Nightly memory consolidation complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Memory consolidation failed: {e}", exc_info=True)
 
     def stop(self):
         """Stop the background scheduler."""
