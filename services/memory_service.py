@@ -82,7 +82,7 @@ Existing summary to refine (if provided): {summary[:500] if summary else 'None'}
 Return ONLY valid JSON, no markdown."""
 
         response = await openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[{"role": "user", "content": extraction_prompt}],
             temperature=0.3,
             response_format={"type": "json_object"},
@@ -228,7 +228,7 @@ Facts:
 Return ONLY valid JSON array."""
 
         response = await openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[{"role": "user", "content": consolidation_prompt}],
             temperature=0.2,
             response_format={"type": "json_object"},
