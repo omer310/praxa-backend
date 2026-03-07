@@ -820,7 +820,6 @@ async def entrypoint(ctx: JobContext):
                     room_name=room_name,
                     participant_identity="phone-user",
                     participant_name="Phone User",
-                    play_ringtone=True,
                 )
             )
 
@@ -833,11 +832,23 @@ async def entrypoint(ctx: JobContext):
                     "call_sid": sip_response.sip_call_id if sip_response else None
                 })
 
-            print("Waiting for phone participant to connect...", flush=True)
-            participant = await ctx.wait_for_participant()
+            print("Waiting for phone participant to connect (60s timeout)...", flush=True)
+            try:
+                participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=60.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Phone participant did not connect within 60s — call not answered")
+                print("Call not answered within 60 seconds — ending", flush=True)
+                if call_log_id:
+                    await praxa.db.update_call_log(call_log_id, {
+                        "status": "no_answer",
+                        "failure_reason": "Call not answered within 60 seconds"
+                    })
+                return
             print(f"Phone participant connected: {participant.identity}", flush=True)
             logger.info(f"Phone participant connected: {participant.identity}")
 
+        except asyncio.TimeoutError:
+            raise
         except Exception as e:
             logger.error(f"Failed to dial out via SIP: {e}")
             if call_log_id:
@@ -1035,8 +1046,13 @@ async def entrypoint(ctx: JobContext):
             # Try to get conversation history from session.history (LiveKit v1.0+ API)
             if hasattr(session, 'history'):
                 history = session.history
-                # ChatContext is iterable but doesn't have len()
-                history_items = list(history) if history else []
+                # ChatContext in LiveKit v1.0+ has a .messages attribute, not directly iterable
+                if hasattr(history, 'messages'):
+                    history_items = list(history.messages)
+                elif hasattr(history, 'items'):
+                    history_items = list(history.items)
+                else:
+                    history_items = []
                 logger.info(f"[TRANSCRIPT FINAL] Found session.history with {len(history_items)} items")
                 print(f"[TRANSCRIPT FINAL] session.history has {len(history_items)} items", flush=True)
                 
