@@ -150,10 +150,22 @@ async def trigger_call_for_user(user_id: str) -> Optional[dict]:
             logger.error(f"No phone number for user: {user_id}")
             return None
         
-        # Format phone number (ensure E.164)
-        if not phone_number.startswith("+"):
+        # Normalize to strict E.164 format (digits only after +)
+        # Handles formats like +1(646) 847-2984, (646) 847-2984, 6468472984, etc.
+        import re
+        digits = re.sub(r'\D', '', phone_number)
+        if phone_number.startswith("+"):
+            phone_number = f"+{digits}"
+        elif digits and len(digits) == 10:
             country_code = settings.get("phone_country_code", "+1")
-            phone_number = f"{country_code}{phone_number}"
+            phone_number = f"{country_code}{digits}"
+        elif digits and len(digits) == 11 and digits.startswith("1"):
+            phone_number = f"+{digits}"
+        else:
+            country_code = settings.get("phone_country_code", "+1")
+            phone_number = f"{country_code}{digits}"
+        
+        logger.info(f"Normalized phone number to E.164: {phone_number}")
         
         # Check if phone is verified
         if not settings.get("phone_verified", False):

@@ -820,6 +820,11 @@ async def entrypoint(ctx: JobContext):
                 logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
                 return
 
+            # Normalize to strict E.164 — strip any formatting chars like (646) 847-2984
+            import re as _re
+            _digits = _re.sub(r'\D', '', phone_number)
+            phone_number = f"+{_digits}" if phone_number.startswith("+") else f"+1{_digits}"
+            
             print(f"Dialing out to {phone_number} via SIP...", flush=True)
             logger.info(f"Dialing out to {phone_number} via SIP...")
 
