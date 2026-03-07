@@ -794,8 +794,20 @@ async def entrypoint(ctx: JobContext):
     )
     _current_agent = praxa
     
-    # Load user context
-    await praxa.load_user_context()
+    try:
+        await praxa.load_user_context()
+    except Exception as e:
+        logger.error(f"FATAL: load_user_context failed for user {user_id}: {type(e).__name__}: {e}", exc_info=True)
+        print(f"FATAL: load_user_context failed: {type(e).__name__}: {e}", flush=True)
+        if call_log_id:
+            try:
+                await praxa.db.update_call_log(call_log_id, {
+                    "status": "failed",
+                    "failure_reason": f"Context load failed: {type(e).__name__}: {str(e)}"
+                })
+            except Exception:
+                pass
+        return
     
     # Phone call mode: dial out via SIP. In-app mode: user is already in the room.
     participant = None
@@ -850,11 +862,15 @@ async def entrypoint(ctx: JobContext):
         except asyncio.TimeoutError:
             raise
         except Exception as e:
-            logger.error(f"Failed to dial out via SIP: {e}")
+            logger.error(f"FATAL SIP ERROR: {type(e).__name__}: {e}", exc_info=True)
+            print(f"FATAL SIP ERROR: {type(e).__name__}: {e}", flush=True)
+            print(f"  SIP trunk ID: {LIVEKIT_SIP_TRUNK_ID[:10]}..." if LIVEKIT_SIP_TRUNK_ID else "  SIP trunk ID: NOT SET", flush=True)
+            print(f"  Phone number: {phone_number}", flush=True)
+            print(f"  LiveKit URL: {LIVEKIT_URL}", flush=True)
             if call_log_id:
                 await praxa.db.update_call_log(call_log_id, {
                     "status": "failed",
-                    "failure_reason": f"SIP dial failed: {str(e)}"
+                    "failure_reason": f"{type(e).__name__}: {str(e)}"
                 })
             return
 
