@@ -876,7 +876,7 @@ async def entrypoint(ctx: JobContext):
         
         tts = elevenlabs.TTS(
             api_key=os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY"),
-            voice_id=os.getenv("ELEVEN_LABS_VOICE_ID", "Pcfg2Zc6kmNWQ9ji3J5F"),
+            voice_id=os.getenv("ELEVEN_LABS_VOICE_ID", "r5iFzIytiA1rzjhWFCjW"),
         )
         logger.info("ElevenLabs TTS initialized")
         
