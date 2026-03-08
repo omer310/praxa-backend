@@ -907,9 +907,14 @@ async def entrypoint(ctx: JobContext):
         llm_instance = openai.LLM(model="gpt-4o")
         logger.info("OpenAI LLM initialized")
         
+        eleven_api_key = os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
+        eleven_voice_id = os.getenv("ELEVEN_LABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+        logger.info(f"ElevenLabs TTS: voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}")
+        print(f"[TTS] ElevenLabs voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}", flush=True)
         tts = elevenlabs.TTS(
-            api_key=os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY"),
-            voice_id=os.getenv("ELEVEN_LABS_VOICE_ID", "r5iFzIytiA1rzjhWFCjW"),
+            api_key=eleven_api_key,
+            voice_id=eleven_voice_id,
+            model="eleven_flash_v2_5",
         )
         logger.info("ElevenLabs TTS initialized")
         
@@ -1021,8 +1026,14 @@ async def entrypoint(ctx: JobContext):
         # Say the opening message
         opening_msg = praxa._get_opening_message()
         logger.info(f"Saying opening message: {opening_msg[:50]}...")
-        await session.say(opening_msg, allow_interruptions=True)
-        logger.info("Opening message sent!")
+        print(f"[OPENING MSG] Attempting session.say()...", flush=True)
+        try:
+            await session.say(opening_msg, allow_interruptions=True)
+            logger.info("Opening message sent!")
+            print("[OPENING MSG] session.say() completed successfully", flush=True)
+        except Exception as tts_err:
+            logger.error(f"[OPENING MSG] session.say() FAILED: {type(tts_err).__name__}: {tts_err}", exc_info=True)
+            print(f"[OPENING MSG] FAILED: {type(tts_err).__name__}: {tts_err}", flush=True)
         
         # The session is now running - but we need to keep this function alive
         # Otherwise the finally block will execute and end the call prematurely!
