@@ -809,92 +809,9 @@ async def entrypoint(ctx: JobContext):
                 pass
         return
     
-    # Phone call mode: dial out via SIP. In-app mode: user is already in the room.
-    participant = None
-    if not is_in_app:
-        try:
-            print(f"LIVEKIT_SIP_TRUNK_ID = {LIVEKIT_SIP_TRUNK_ID}", flush=True)
-
-            if not LIVEKIT_SIP_TRUNK_ID:
-                print("ERROR: LIVEKIT_SIP_TRUNK_ID not configured!", flush=True)
-                logger.error("LIVEKIT_SIP_TRUNK_ID not configured - cannot make outbound calls")
-                return
-
-            # Normalize to strict E.164 — strip any formatting chars like (646) 847-2984
-            import re as _re
-            _digits = _re.sub(r'\D', '', phone_number)
-            phone_number = f"+{_digits}" if phone_number.startswith("+") else f"+1{_digits}"
-            
-            print(f"Dialing out to {phone_number} via SIP...", flush=True)
-            logger.info(f"Dialing out to {phone_number} via SIP...")
-
-            lk_api = livekit_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-
-            sip_response = await lk_api.sip.create_sip_participant(
-                livekit_api.CreateSIPParticipantRequest(
-                    sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
-                    sip_call_to=phone_number,
-                    room_name=room_name,
-                    participant_identity="phone-user",
-                    participant_name="Phone User",
-                )
-            )
-
-            await lk_api.aclose()
-            logger.info(f"SIP call initiated to {phone_number}")
-
-            if call_log_id:
-                await praxa.db.update_call_log(call_log_id, {
-                    "status": "ringing",
-                    "call_sid": sip_response.sip_call_id if sip_response else None
-                })
-
-            print("Waiting for phone participant to connect (60s timeout)...", flush=True)
-            try:
-                participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=60.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"Phone participant did not connect within 60s — call not answered")
-                print("Call not answered within 60 seconds — ending", flush=True)
-                if call_log_id:
-                    await praxa.db.update_call_log(call_log_id, {
-                        "status": "no_answer",
-                        "failure_reason": "Call not answered within 60 seconds"
-                    })
-                return
-            print(f"Phone participant connected: {participant.identity}", flush=True)
-            logger.info(f"Phone participant connected: {participant.identity}")
-
-        except asyncio.TimeoutError:
-            raise
-        except Exception as e:
-            logger.error(f"FATAL SIP ERROR: {type(e).__name__}: {e}", exc_info=True)
-            print(f"FATAL SIP ERROR: {type(e).__name__}: {e}", flush=True)
-            print(f"  SIP trunk ID: {LIVEKIT_SIP_TRUNK_ID[:10]}..." if LIVEKIT_SIP_TRUNK_ID else "  SIP trunk ID: NOT SET", flush=True)
-            print(f"  Phone number: {phone_number}", flush=True)
-            print(f"  LiveKit URL: {LIVEKIT_URL}", flush=True)
-            if call_log_id:
-                await praxa.db.update_call_log(call_log_id, {
-                    "status": "failed",
-                    "failure_reason": f"{type(e).__name__}: {str(e)}"
-                })
-            return
-
-        await praxa.on_call_started()
-        logger.info("Phone call marked as started, creating agent session...")
-    else:
-        print("In-app mode — waiting for user participant...", flush=True)
-        logger.info("In-app mode — waiting for user participant in room")
-        try:
-            participant = await ctx.wait_for_participant()
-            print(f"User participant ready: {participant.identity}", flush=True)
-            logger.info(f"In-app user participant: {participant.identity}")
-        except Exception as e:
-            logger.error(f"Failed to get in-app participant: {e}")
-            return
-        logger.info("In-app session ready, creating agent session...")
-    
+    # ── Build voice pipeline first (needed before we can start the session) ──
+    session = None
     try:
-        # Initialize voice pipeline components
         logger.info("Initializing voice pipeline components...")
         
         vad = silero.VAD.load()
@@ -917,12 +834,10 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info("ElevenLabs TTS initialized")
         
-        # Create the Praxa agent with function tools for task management
         PraxaVoiceAgent = create_praxa_agent_class(praxa)
         agent = PraxaVoiceAgent()
         logger.info("PraxaVoiceAgent created with function tools")
         
-        # Create AgentSession with pipeline components
         session = AgentSession(
             vad=vad,
             stt=stt,
@@ -1006,26 +921,93 @@ async def entrypoint(ctx: JobContext):
         logger.info("[TRANSCRIPT DEBUG] Event listeners registered: conversation_item_added, user_input_transcribed")
         print("[TRANSCRIPT DEBUG] Event listeners registered successfully", flush=True)
         
-        # Start the session
-        logger.info(f"Starting session with participant: {participant.identity}")
-        
-        # v1.0 uses room= and agent=
-        try:
-            await session.start(room=ctx.room, agent=agent)
-        except TypeError as e:
-            logger.info(f"First start attempt failed: {e}, trying without agent")
+        participant = None
+
+        if not is_in_app:
+            # ── Phone call mode (livekit-agents 1.3.x outbound pattern) ──────────
+            print(f"LIVEKIT_SIP_TRUNK_ID = {LIVEKIT_SIP_TRUNK_ID}", flush=True)
+            if not LIVEKIT_SIP_TRUNK_ID:
+                logger.error("LIVEKIT_SIP_TRUNK_ID not configured")
+                return
+
+            import re as _re
+            _digits = _re.sub(r'\D', '', phone_number)
+            phone_number = f"+{_digits}" if phone_number.startswith("+") else f"+1{_digits}"
+
+            if call_log_id:
+                await praxa.db.update_call_log(call_log_id, {"status": "ringing"})
+
+            # Start the session CONCURRENTLY before dialing — critical so the agent
+            # is ready to capture audio the moment the call is answered.
+            logger.info("Starting AgentSession concurrently before dialing...")
+            session_task = asyncio.create_task(session.start(agent=agent, room=ctx.room))
+
+            # Dial out. wait_until_answered=True blocks until the user picks up (or fails).
+            print(f"Dialing out to {phone_number} via SIP (waiting until answered)...", flush=True)
+            logger.info(f"Dialing out to {phone_number} via SIP...")
             try:
-                await session.start(room=ctx.room)
-            except TypeError as e2:
-                logger.info(f"Second start attempt failed: {e2}, trying with no params")
-                await session.start()
-        
-        logger.info("Session started!")
-        
-        # Say the opening message
+                await ctx.api.sip.create_sip_participant(
+                    livekit_api.CreateSIPParticipantRequest(
+                        sip_trunk_id=LIVEKIT_SIP_TRUNK_ID,
+                        sip_call_to=phone_number,
+                        room_name=room_name,
+                        participant_identity="phone-user",
+                        participant_name="Phone User",
+                        wait_until_answered=True,
+                    )
+                )
+                logger.info(f"Call answered: {phone_number}")
+                print("Call answered!", flush=True)
+            except Exception as e:
+                session_task.cancel()
+                logger.error(f"FATAL SIP ERROR: {type(e).__name__}: {e}", exc_info=True)
+                print(f"FATAL SIP ERROR: {type(e).__name__}: {e}", flush=True)
+                if call_log_id:
+                    sip_meta = getattr(e, 'metadata', {}) or {}
+                    sip_code = str(sip_meta.get('sip_status_code', ''))
+                    status = "no_answer" if sip_code in ('408', '480', '487') else "failed"
+                    await praxa.db.update_call_log(call_log_id, {
+                        "status": status,
+                        "failure_reason": f"{type(e).__name__}: {str(e)}"
+                    })
+                return
+
+            # Wait for session startup to complete
+            await session_task
+            logger.info("AgentSession started successfully")
+
+            # Retrieve the now-connected phone participant
+            try:
+                participant = await asyncio.wait_for(
+                    ctx.wait_for_participant(identity="phone-user"),
+                    timeout=10.0
+                )
+                print(f"Phone participant connected: {participant.identity}", flush=True)
+                logger.info(f"Phone participant connected: {participant.identity}")
+            except asyncio.TimeoutError:
+                logger.warning("Phone participant not found after answering (unusual)")
+
+            await praxa.on_call_started()
+            logger.info("Phone call marked as started")
+
+        else:
+            # ── In-app mode ───────────────────────────────────────────────────────
+            print("In-app mode — waiting for user participant...", flush=True)
+            logger.info("In-app mode — waiting for user participant in room")
+            try:
+                participant = await ctx.wait_for_participant()
+                print(f"User participant ready: {participant.identity}", flush=True)
+                logger.info(f"In-app user participant: {participant.identity}")
+            except Exception as e:
+                logger.error(f"Failed to get in-app participant: {e}")
+                return
+            await session.start(agent=agent, room=ctx.room)
+            logger.info("In-app session started")
+
+        # ── Say opening message ───────────────────────────────────────────────────
         opening_msg = praxa._get_opening_message()
         logger.info(f"Saying opening message: {opening_msg[:50]}...")
-        print(f"[OPENING MSG] Attempting session.say()...", flush=True)
+        print("[OPENING MSG] Attempting session.say()...", flush=True)
         try:
             await session.say(opening_msg, allow_interruptions=True)
             logger.info("Opening message sent!")
@@ -1033,9 +1015,7 @@ async def entrypoint(ctx: JobContext):
         except Exception as tts_err:
             logger.error(f"[OPENING MSG] session.say() FAILED: {type(tts_err).__name__}: {tts_err}", exc_info=True)
             print(f"[OPENING MSG] FAILED: {type(tts_err).__name__}: {tts_err}", flush=True)
-        
-        # The session is now running - but we need to keep this function alive
-        # Otherwise the finally block will execute and end the call prematurely!
+
         logger.info("Session running - monitoring for disconnect...")
         print("Session running - monitoring for disconnect...", flush=True)
         
@@ -1076,7 +1056,7 @@ async def entrypoint(ctx: JobContext):
         
         try:
             # Try to get conversation history from session.history (LiveKit v1.0+ API)
-            if hasattr(session, 'history'):
+            if session is not None and hasattr(session, 'history'):
                 history = session.history
                 # ChatContext in LiveKit v1.0+ has a .messages attribute, not directly iterable
                 if hasattr(history, 'messages'):
