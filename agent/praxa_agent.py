@@ -837,7 +837,6 @@ async def entrypoint(ctx: JobContext):
                     room_name=room_name,
                     participant_identity="phone-user",
                     participant_name="Phone User",
-                    play_ringtone=True,
                 )
             )
 
