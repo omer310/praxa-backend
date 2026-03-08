@@ -176,21 +176,28 @@ async def trigger_call_for_user(user_id: str) -> Optional[dict]:
         call_id = str(uuid4())[:8]
         room_name = f"praxa-call-{user_id}-{call_id}"
         
-        # Get Nylas calendar grant ID (optional - agent will work without it)
+        # Get Nylas grant IDs (calendar + email) — optional, agent works without them
         calendar_grant_id = None
+        email_grant_id = None
         try:
-            # Query nylas_oauth_tokens for calendar grant
-            calendar_token = db.client.table("nylas_oauth_tokens").select("grant_id").eq(
+            nylas_tokens = db.client.table("nylas_oauth_tokens").select("grant_id,integration_type").eq(
                 "user_id", user_id
-            ).eq("integration_type", "calendar").limit(1).execute()
+            ).execute()
             
-            if calendar_token.data and len(calendar_token.data) > 0:
-                calendar_grant_id = calendar_token.data[0].get("grant_id")
-                logger.info(f"Found calendar grant ID for user {user_id}: {calendar_grant_id[:20]}...")
-            else:
-                logger.info(f"No calendar grant ID found for user {user_id} - agent will skip calendar features")
+            for token in (nylas_tokens.data or []):
+                if token.get("integration_type") == "calendar" and not calendar_grant_id:
+                    calendar_grant_id = token.get("grant_id")
+                elif token.get("integration_type") == "email" and not email_grant_id:
+                    email_grant_id = token.get("grant_id")
+            
+            if calendar_grant_id:
+                logger.info(f"Found calendar grant for user {user_id}: {calendar_grant_id[:20]}...")
+            if email_grant_id:
+                logger.info(f"Found email grant for user {user_id}: {email_grant_id[:20]}...")
+            if not calendar_grant_id and not email_grant_id:
+                logger.info(f"No Nylas grants found for user {user_id} - agent will skip email/calendar features")
         except Exception as e:
-            logger.warning(f"Error fetching calendar grant ID: {e}")
+            logger.warning(f"Error fetching Nylas grant IDs: {e}")
         
         # Create call log entry
         call_log = await db.create_call_log(
@@ -221,9 +228,10 @@ async def trigger_call_for_user(user_id: str) -> Optional[dict]:
                 "phone_number": phone_number,
             }
             
-            # Add calendar grant ID if available
             if calendar_grant_id:
                 metadata_dict["calendar_grant_id"] = calendar_grant_id
+            if email_grant_id:
+                metadata_dict["email_grant_id"] = email_grant_id
             
             room_metadata = json.dumps(metadata_dict)
             

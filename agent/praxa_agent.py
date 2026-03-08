@@ -117,6 +117,9 @@ class PraxaAgent:
         self.calendar_events: list[dict] = []
         self.calendar_busy_count: int = 0
         
+        # Email context (loaded if grant ID available)
+        self.email_summary: str = ""
+        
         # Memory context (loaded at session start)
         self.session_context: str = ""
 
@@ -156,7 +159,14 @@ class PraxaAgent:
                     await self._load_calendar_context()
                 except Exception as e:
                     logger.warning(f"Error loading calendar context: {e}")
-                    # Don't fail the call if calendar fails
+            
+            # Pre-load email summary if grant ID available
+            if self.email_grant_id:
+                try:
+                    self.email_summary = await self._fetch_email_summary()
+                    logger.info(f"Loaded email summary ({len(self.email_summary)} chars)")
+                except Exception as e:
+                    logger.warning(f"Error loading email context: {e}")
             
             logger.info(
                 f"Loaded context for user {self.user_id}: "
@@ -235,7 +245,8 @@ class PraxaAgent:
             recently_completed=self.recently_completed,
             checkin_frequency=checkin_frequency,
             calendar_events=self.calendar_events if self.calendar_grant_id else None,
-            calendar_busy_count=self.calendar_busy_count
+            calendar_busy_count=self.calendar_busy_count,
+            email_summary=self.email_summary if self.email_grant_id else None,
         )
         
         base_prompt = IN_APP_SYSTEM_PROMPT if self.is_in_app else SYSTEM_PROMPT
@@ -254,7 +265,8 @@ class PraxaAgent:
         return get_opening_message(
             user_name=user_name,
             this_week_count=len(self.this_week_tasks),
-            recently_completed_count=len(self.recently_completed)
+            recently_completed_count=len(self.recently_completed),
+            calendar_events=self.calendar_events if self.calendar_grant_id else None,
         )
 
     def _find_task_by_title(self, title: str) -> Optional[dict]:
@@ -485,8 +497,19 @@ Transcript:
         try:
             bucket = await self.db.get_bucket_by_name(self.user_id, bucket_name)
             if not bucket:
+                # Try fuzzy match against loaded buckets
+                bucket_name_lower = bucket_name.lower()
+                for b in self.buckets:
+                    if bucket_name_lower in b["name"].lower() or b["name"].lower() in bucket_name_lower:
+                        bucket = b
+                        break
+            
+            if not bucket:
                 bucket_names = await self.db.get_user_bucket_names(self.user_id)
-                return f"I don't see a bucket called '{bucket_name}'. Your buckets are: {', '.join(bucket_names)}. Which one should I use?"
+                if bucket_names:
+                    return f"I don't see a bucket called '{bucket_name}'. Your buckets are: {', '.join(bucket_names)}. Which one should I use?"
+                else:
+                    return "You don't have any buckets yet. Want me to create one first?"
             
             new_task = await self.db.create_task(
                 user_id=self.user_id,
@@ -628,6 +651,165 @@ Transcript:
             logger.error(f"Error getting today's calendar: {e}")
             return "I had trouble getting today's events."
 
+    async def create_bucket(self, name: str, goal: Optional[str] = None) -> str:
+        """Create a new bucket/initiative."""
+        try:
+            existing_names = await self.db.get_user_bucket_names(self.user_id)
+            for existing in existing_names:
+                if existing.lower() == name.lower():
+                    return f"You already have a bucket called '{existing}'. Want me to add tasks to that one instead?"
+            
+            bucket = await self.db.create_bucket(
+                user_id=self.user_id,
+                name=name,
+                goal=goal,
+            )
+            
+            if bucket:
+                self.buckets = await self.db.get_user_buckets_with_loops(self.user_id)
+                goal_note = f" with the goal: {goal}" if goal else ""
+                logger.info(f"Created bucket: {name}")
+                return f"Done! I've created a new initiative called '{name}'{goal_note}. You can start adding tasks to it."
+            else:
+                return "Sorry, I had trouble creating that bucket."
+        except Exception as e:
+            logger.error(f"Error creating bucket: {e}")
+            return "Sorry, something went wrong creating that initiative."
+
+    async def update_loop(
+        self,
+        task_title: str,
+        priority: Optional[str] = None,
+        status: Optional[str] = None,
+        description: Optional[str] = None,
+        is_this_week: Optional[bool] = None,
+        estimated_duration_minutes: Optional[int] = None,
+    ) -> str:
+        """Update one or more fields on an existing loop/task."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+            
+            updates: dict = {}
+            changes: list[str] = []
+
+            if priority and priority in ("low", "medium", "high"):
+                updates["priority"] = priority
+                changes.append(f"priority → {priority}")
+            if status and status in ("open", "in_progress", "done"):
+                updates["status"] = status
+                changes.append(f"status → {status}")
+            if description is not None:
+                updates["description"] = description
+                changes.append("description updated")
+            if is_this_week is not None:
+                updates["is_this_week"] = is_this_week
+                changes.append("added to this week's focus" if is_this_week else "removed from this week's focus")
+            if estimated_duration_minutes is not None and estimated_duration_minutes > 0:
+                updates["estimated_duration_minutes"] = estimated_duration_minutes
+                changes.append(f"estimated time → {estimated_duration_minutes} min")
+            
+            if not updates:
+                return "Nothing to update — tell me what you'd like to change."
+            
+            await self.db.update_loop(task["id"], updates)
+            self.tasks_discussed.append(task["id"])
+            
+            logger.info(f"Updated loop '{task_title}': {changes}")
+            return f"Updated '{task_title}': {', '.join(changes)}."
+        except Exception as e:
+            logger.error(f"Error updating loop: {e}")
+            return "Sorry, I had trouble updating that task."
+
+    async def schedule_loop(self, task_title: str, scheduled_time: str) -> str:
+        """Set a specific scheduled time for a loop/task."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+            
+            from datetime import datetime as dt
+            try:
+                parsed = dt.fromisoformat(scheduled_time.replace("Z", "+00:00"))
+                display = parsed.strftime("%A, %B %d at %I:%M %p")
+            except ValueError:
+                display = scheduled_time
+            
+            await self.db.update_loop(task["id"], {
+                "scheduled_time": scheduled_time,
+                "is_this_week": True,
+            })
+            self.tasks_discussed.append(task["id"])
+            
+            logger.info(f"Scheduled loop '{task_title}' for {scheduled_time}")
+            return f"Got it! '{task_title}' is scheduled for {display} and added to this week's focus."
+        except Exception as e:
+            logger.error(f"Error scheduling loop: {e}")
+            return "Sorry, I had trouble scheduling that task."
+
+    async def check_email(self) -> str:
+        """Check recent important emails."""
+        if not self.email_grant_id:
+            return "Your email isn't connected to Praxa right now."
+        
+        if hasattr(self, "email_summary") and self.email_summary:
+            return self.email_summary
+        
+        try:
+            summary = await self._fetch_email_summary()
+            self.email_summary = summary
+            return summary
+        except Exception as e:
+            logger.error(f"Error checking email: {e}")
+            return "I had trouble checking your email right now."
+
+    async def _fetch_email_summary(self) -> str:
+        """Fetch and summarize recent emails via Nylas."""
+        if not NYLAS_API_KEY or not self.email_grant_id:
+            return "Email not connected."
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"https://api.us.nylas.com/v3/grants/{self.email_grant_id}/messages",
+                    headers={
+                        "Authorization": f"Bearer {NYLAS_API_KEY}",
+                        "Accept": "application/json"
+                    },
+                    params={"limit": 10, "fields": "id,subject,from,date,snippet,unread"}
+                )
+                
+                if response.status_code != 200:
+                    return "I couldn't access your email right now."
+                
+                messages = response.json().get("data", [])
+                if not messages:
+                    return "No recent emails found."
+                
+                unread = [m for m in messages if m.get("unread")]
+                
+                lines = []
+                if unread:
+                    lines.append(f"You have {len(unread)} unread emails.")
+                    for msg in unread[:5]:
+                        sender = msg.get("from", [{}])[0].get("name", "Unknown") if msg.get("from") else "Unknown"
+                        subject = msg.get("subject", "(no subject)")
+                        snippet = msg.get("snippet", "")[:80]
+                        lines.append(f"• From {sender}: '{subject}' — {snippet}")
+                else:
+                    lines.append(f"Your most recent {len(messages)} emails are all read.")
+                    for msg in messages[:3]:
+                        sender = msg.get("from", [{}])[0].get("name", "Unknown") if msg.get("from") else "Unknown"
+                        subject = msg.get("subject", "(no subject)")
+                        lines.append(f"• From {sender}: '{subject}'")
+                
+                return "\n".join(lines)
+        
+        except Exception as e:
+            logger.error(f"Error fetching email summary: {e}")
+            return "I had trouble fetching your emails."
+
 
 # Global agent instance for the current session
 _current_agent: Optional[PraxaAgent] = None
@@ -663,11 +845,11 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         
         @function_tool
         async def create_task(self, title: str, bucket_name: str, is_this_week: bool = False) -> str:
-            """Create a new task. Ask the user which bucket/initiative to add it to.
+            """Create a new task in a bucket/initiative. Infer the best bucket from context — only ask the user if you have no idea which one fits.
             
             Args:
                 title: The title of the new task
-                bucket_name: The name of the bucket/initiative to add the task to
+                bucket_name: The name of the bucket/initiative to add the task to (infer from context if possible)
                 is_this_week: Whether to mark this for the current week's focus
             """
             return await praxa.create_task(title, bucket_name, is_this_week)
@@ -696,6 +878,53 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         async def get_todays_calendar(self) -> str:
             """Get today's calendar events. Use when user asks about today's schedule."""
             return await praxa.get_todays_calendar()
+
+        @function_tool
+        async def create_bucket(self, name: str, goal: Optional[str] = None) -> str:
+            """Create a new bucket/initiative category. Use when the user wants to start tracking a new area of their life or work.
+            
+            Args:
+                name: Name for the new bucket/initiative (e.g. 'Health', 'Side Project', 'Learning')
+                goal: Optional goal statement for this initiative (e.g. 'Run a 5k by June')
+            """
+            return await praxa.create_bucket(name, goal)
+
+        @function_tool
+        async def update_loop(
+            self,
+            task_title: str,
+            priority: Optional[str] = None,
+            status: Optional[str] = None,
+            description: Optional[str] = None,
+            is_this_week: Optional[bool] = None,
+            estimated_duration_minutes: Optional[int] = None,
+        ) -> str:
+            """Update an existing task's properties. Use when the user wants to change priority, status, add a description, or mark it for this week.
+            
+            Args:
+                task_title: Title of the task to update
+                priority: New priority - must be 'low', 'medium', or 'high'
+                status: New status - must be 'open', 'in_progress', or 'done'
+                description: New description for the task
+                is_this_week: Whether to include this task in this week's focus
+                estimated_duration_minutes: Estimated time to complete in minutes
+            """
+            return await praxa.update_loop(task_title, priority, status, description, is_this_week, estimated_duration_minutes)
+
+        @function_tool
+        async def schedule_loop(self, task_title: str, scheduled_time: str) -> str:
+            """Schedule a task for a specific date and time. Use when the user says they'll do something at a specific time.
+            
+            Args:
+                task_title: Title of the task to schedule
+                scheduled_time: ISO 8601 datetime string (e.g. '2026-03-10T14:00:00')
+            """
+            return await praxa.schedule_loop(task_title, scheduled_time)
+
+        @function_tool
+        async def check_email(self) -> str:
+            """Check the user's recent emails for anything important. Use when user asks about emails, or proactively at call start if email is connected."""
+            return await praxa.check_email()
     
     return PraxaVoiceAgent
 

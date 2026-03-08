@@ -356,6 +356,72 @@ class SupabaseClient:
             logger.error(f"Error updating task status: {e}")
             raise
 
+    async def update_loop(self, loop_id: str, updates: dict) -> dict:
+        """
+        Update any fields on a loop/task.
+        
+        Args:
+            loop_id: The UUID of the task/loop
+            updates: Dict of fields to update (title, priority, status, description,
+                     scheduled_time, estimated_duration_minutes, is_this_week, etc.)
+            
+        Returns:
+            Updated task data
+        """
+        try:
+            updates["updated_at"] = datetime.utcnow().isoformat()
+            response = self.client.table("loops").update(updates).eq("id", loop_id).execute()
+            logger.info(f"Updated loop {loop_id}: {list(updates.keys())}")
+            return response.data[0] if response.data else {}
+        except Exception as e:
+            logger.error(f"Error updating loop: {e}")
+            raise
+
+    async def create_bucket(
+        self,
+        user_id: str,
+        name: str,
+        description: Optional[str] = None,
+        color: str = "#6366F1",
+        icon: str = "folder",
+        goal: Optional[str] = None,
+    ) -> dict:
+        """
+        Create a new bucket/initiative for a user.
+        
+        Args:
+            user_id: The UUID of the user
+            name: Bucket name
+            description: Optional description
+            color: Hex color (defaults to indigo)
+            icon: Icon name (defaults to 'folder')
+            goal: Optional goal statement for the bucket
+            
+        Returns:
+            Created bucket data
+        """
+        try:
+            bucket_data = {
+                "user_id": user_id,
+                "name": name,
+                "color": color,
+                "icon": icon,
+                "archived": False,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            if description:
+                bucket_data["description"] = description
+            if goal:
+                bucket_data["goal"] = goal
+            
+            response = self.client.table("buckets").insert(bucket_data).execute()
+            logger.info(f"Created bucket '{name}' for user {user_id}")
+            return response.data[0] if response.data else {}
+        except Exception as e:
+            logger.error(f"Error creating bucket: {e}")
+            raise
+
     # ==================== Call Management ====================
 
     async def create_call_log(
