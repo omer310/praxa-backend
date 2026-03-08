@@ -824,7 +824,7 @@ async def entrypoint(ctx: JobContext):
         logger.info("OpenAI LLM initialized")
         
         eleven_api_key = os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
-        eleven_voice_id = os.getenv("ELEVEN_LABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+        eleven_voice_id = os.getenv("ELEVEN_LABS_VOICE_ID", "r5iFzIytiA1rzjhWFCjW")
         logger.info(f"ElevenLabs TTS: voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}")
         print(f"[TTS] ElevenLabs voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}", flush=True)
         tts = elevenlabs.TTS(
