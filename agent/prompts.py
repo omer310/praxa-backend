@@ -41,6 +41,12 @@ CREATE NEW BUCKET (create_bucket):
 - "Can you create a new initiative for my side project?"
 → Create it and confirm: "Created '[name]' initiative."
 
+UPDATE BUCKET GOAL/DESCRIPTION (update_bucket):
+- "Actually, my goal for Health has changed — I want to run a marathon now"
+- "Update my Work goal to getting promoted by Q3"
+- "Can you add a description to my Learning initiative?"
+→ Update it immediately: "Updated your [initiative] goal to: [new goal]."
+
 CHECK EMAIL (check_email):
 - "Any important emails?", "What's in my inbox?"
 → Call check_email and summarize.
@@ -98,11 +104,17 @@ Conversation Flow — FOLLOW THIS ORDER:
    - IF calendar connected → mention total events and busiest/lightest day
    - IF email connected → mention any urgent/unread emails
    - IF overdue tasks → mention them gently
-3. Go through priority tasks one by one — ask about progress, use tools based on response
+3. **Goal-centric progress check** (this is the core of the call):
+   - Go through each initiative that has tasks this week, one at a time
+   - For each one: briefly state the goal ("Your [Initiative] goal is [goal]"), then ask how they feel about progress toward it — not just whether tasks got done
+   - Connect completed tasks to the goal: "You finished [task] — that's moving the needle on [goal]"
+   - If tasks toward a goal were skipped, ask what got in the way — use add_task_note to capture blockers
+   - If a bucket has a goal but ZERO tasks this week, flag it gently: "You didn't have anything planned toward [goal] this week — was that intentional?"
+   - If the user says their goal has changed or they want to refine it, use update_bucket to update it on the spot
 4. Capture insights, blockers, and progress as notes automatically
-5. Offer suggestions; if agreed, create follow-up tasks
+5. Offer suggestions; if agreed, create follow-up tasks tied to the relevant goal
 6. Use calendar to find good times for focused work when relevant
-7. Wrap up with encouragement and mention next call time
+7. Wrap up with encouragement framed around goals, not just tasks — mention next call time
 
 Keep the call focused — aim for 3-5 minutes unless the user wants more.
 
@@ -163,12 +175,16 @@ def get_user_context_prompt(
     
     # This week's tasks
     if this_week_tasks:
+        bucket_goal_map = {b['name']: b.get('goal') for b in buckets if b.get('goal')}
         task_list = []
         for task in this_week_tasks:
             priority = f" [{task['priority']}]" if task.get('priority') != 'medium' else ""
-            bucket_name = f" ({task.get('bucket_name', 'Unknown')})" if task.get('bucket_name') else ""
+            bucket_name = task.get('bucket_name', '')
+            bucket_note = f" ({bucket_name})" if bucket_name else ""
+            goal_text = bucket_goal_map.get(bucket_name)
+            goal_note = f" [toward: {goal_text}]" if goal_text else ""
             status = f" - {task['status']}" if task.get('status') != 'open' else ""
-            task_list.append(f"- {task['title']}{priority}{bucket_name}{status}")
+            task_list.append(f"- {task['title']}{priority}{bucket_note}{goal_note}{status}")
         
         context_parts.append(
             f"Tasks marked for THIS WEEK ({len(this_week_tasks)} total):\n" + "\n".join(task_list[:10])

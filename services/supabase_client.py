@@ -940,6 +940,16 @@ class SupabaseClient:
 
     # ==================== Bucket Operations ====================
 
+    async def update_bucket(self, bucket_id: str, updates: dict) -> dict:
+        """Update a bucket's properties (goal, description, etc.)."""
+        try:
+            updates["updated_at"] = datetime.utcnow().isoformat()
+            response = self.client.table("buckets").update(updates).eq("id", bucket_id).execute()
+            return response.data[0] if response.data else {}
+        except Exception as e:
+            logger.error(f"Error updating bucket: {e}")
+            raise
+
     async def get_bucket_by_name(self, user_id: str, bucket_name: str) -> Optional[dict]:
         """
         Find a bucket by name (case-insensitive).

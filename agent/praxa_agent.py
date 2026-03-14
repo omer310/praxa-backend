@@ -651,6 +651,33 @@ Transcript:
             logger.error(f"Error getting today's calendar: {e}")
             return "I had trouble getting today's events."
 
+    async def update_bucket(self, bucket_name: str, goal: Optional[str] = None, description: Optional[str] = None) -> str:
+        """Update a bucket's goal or description."""
+        try:
+            bucket = await self.db.get_bucket_by_name(self.user_id, bucket_name)
+            if not bucket:
+                return f"I couldn't find an initiative called '{bucket_name}'."
+
+            updates: dict = {}
+            changes: list[str] = []
+            if goal is not None:
+                updates["goal"] = goal
+                changes.append("goal updated")
+            if description is not None:
+                updates["description"] = description
+                changes.append("description updated")
+
+            if not updates:
+                return "Nothing to update — tell me what you'd like to change."
+
+            await self.db.update_bucket(bucket["id"], updates)
+            self.buckets = await self.db.get_user_buckets_with_loops(self.user_id)
+            logger.info(f"Updated bucket '{bucket_name}': {changes}")
+            return f"Updated '{bucket_name}': {', '.join(changes)}."
+        except Exception as e:
+            logger.error(f"Error updating bucket: {e}")
+            return "Sorry, I had trouble updating that initiative."
+
     async def create_bucket(self, name: str, goal: Optional[str] = None) -> str:
         """Create a new bucket/initiative."""
         try:
@@ -878,6 +905,17 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         async def get_todays_calendar(self) -> str:
             """Get today's calendar events. Use when user asks about today's schedule."""
             return await praxa.get_todays_calendar()
+
+        @function_tool
+        async def update_bucket(self, bucket_name: str, goal: Optional[str] = None, description: Optional[str] = None) -> str:
+            """Update a bucket/initiative's goal or description. Use when the user wants to change or refine what they're working toward.
+
+            Args:
+                bucket_name: The name of the bucket/initiative to update
+                goal: New goal statement for this initiative (e.g. 'Run a marathon by December')
+                description: New description for this initiative
+            """
+            return await praxa.update_bucket(bucket_name, goal, description)
 
         @function_tool
         async def create_bucket(self, name: str, goal: Optional[str] = None) -> str:
