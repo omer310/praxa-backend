@@ -25,6 +25,17 @@ class SupabaseClient:
 
     # ==================== User & Settings ====================
 
+    async def is_ai_enabled(self, user_id: str) -> bool:
+        """Return False if the user's ai_enabled flag has been turned off by an admin."""
+        try:
+            response = self.client.table("users").select("ai_enabled").eq("id", user_id).maybe_single().execute()
+            if response and response.data:
+                return response.data.get("ai_enabled", True)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not check ai_enabled for user {user_id}: {e}")
+            return True
+
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
         Fetch user settings by user_id.

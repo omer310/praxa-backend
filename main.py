@@ -143,7 +143,11 @@ async def trigger_call_for_user(user_id: str) -> Optional[dict]:
         if not settings.get("calls_enabled", True):
             logger.info(f"Calls disabled for user: {user_id}")
             return None
-        
+
+        if not await db.is_ai_enabled(user_id):
+            logger.warning(f"AI disabled for user {user_id} — skipping call")
+            return None
+
         # Get phone number
         phone_number = settings.get("phone_number")
         if not phone_number:
@@ -397,7 +401,10 @@ async def trigger_call(
     
     if not settings.get("phone_number"):
         raise HTTPException(status_code=400, detail="User has no phone number configured")
-    
+
+    if not await db.is_ai_enabled(user_id):
+        raise HTTPException(status_code=403, detail="AI features are disabled for this account")
+
     # Trigger the call
     result = await trigger_call_for_user(user_id)
     

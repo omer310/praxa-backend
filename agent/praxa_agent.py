@@ -1014,6 +1014,12 @@ async def entrypoint(ctx: JobContext):
         logger.error(f"Error parsing metadata: {e}", exc_info=True)
         return
 
+    db_check = get_supabase_client()
+    if not await db_check.is_ai_enabled(user_id):
+        logger.warning(f"AI disabled for user {user_id} — aborting agent session")
+        print(f"AI disabled for user {user_id} — aborting", flush=True)
+        return
+
     praxa = PraxaAgent(
         user_id=user_id,
         call_log_id=call_log_id,
