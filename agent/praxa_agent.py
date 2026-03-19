@@ -112,6 +112,7 @@ class PraxaAgent:
         self.this_week_tasks: list[dict] = []
         self.overdue_tasks: list[dict] = []
         self.recently_completed: list[dict] = []
+        self.backlog_tasks: list[dict] = []
         
         # Calendar context (loaded if grant ID available)
         self.calendar_events: list[dict] = []
@@ -142,6 +143,9 @@ class PraxaAgent:
             
             # Get overdue tasks
             self.overdue_tasks = await self.db.get_overdue_tasks(self.user_id)
+
+            # Get backlog tasks (not scheduled for this week)
+            self.backlog_tasks = await self.db.get_backlog_tasks(self.user_id)
             
             # Get recently completed
             self.recently_completed = await self.db.get_recently_completed_tasks(self.user_id)
@@ -173,6 +177,7 @@ class PraxaAgent:
                 f"{len(self.buckets)} buckets, "
                 f"{len(self.this_week_tasks)} this week tasks, "
                 f"{len(self.overdue_tasks)} overdue, "
+                f"{len(self.backlog_tasks)} backlog, "
                 f"{len(self.recently_completed)} recently completed, "
                 f"{len(self.calendar_events)} calendar events"
             )
@@ -247,6 +252,7 @@ class PraxaAgent:
             calendar_events=self.calendar_events if self.calendar_grant_id else None,
             calendar_busy_count=self.calendar_busy_count,
             email_summary=self.email_summary if self.email_grant_id else None,
+            backlog_count=len(self.backlog_tasks),
         )
         
         base_prompt = IN_APP_SYSTEM_PROMPT if self.is_in_app else SYSTEM_PROMPT
@@ -283,6 +289,11 @@ class PraxaAgent:
             if title_lower in task["title"].lower():
                 return task
         
+        # Check backlog tasks
+        for task in self.backlog_tasks:
+            if title_lower in task["title"].lower():
+                return task
+        
         # Check all tasks in buckets
         for bucket in self.buckets:
             for task in bucket.get("loops", []):
@@ -290,6 +301,29 @@ class PraxaAgent:
                     return task
         
         return None
+
+    async def get_backlog_tasks_summary(self) -> str:
+        """Return a formatted summary of the user's backlog tasks."""
+        try:
+            if not self.backlog_tasks:
+                self.backlog_tasks = await self.db.get_backlog_tasks(self.user_id)
+
+            if not self.backlog_tasks:
+                return "Your backlog is empty — no tasks waiting."
+
+            lines = [f"You have {len(self.backlog_tasks)} tasks in your backlog:"]
+            for task in self.backlog_tasks[:10]:
+                priority = task.get("priority", "medium")
+                bucket = task.get("bucket_name", "")
+                priority_tag = f" [{priority}]" if priority != "medium" else ""
+                bucket_tag = f" ({bucket})" if bucket else ""
+                lines.append(f"- {task['title']}{priority_tag}{bucket_tag}")
+            if len(self.backlog_tasks) > 10:
+                lines.append(f"... and {len(self.backlog_tasks) - 10} more")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"Error getting backlog summary: {e}")
+            return "I had trouble fetching your backlog."
 
     async def on_call_started(self):
         """Called when the call is connected."""
@@ -963,7 +997,12 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         async def check_email(self) -> str:
             """Check the user's recent emails for anything important. Use when user asks about emails, or proactively at call start if email is connected."""
             return await praxa.check_email()
-    
+
+        @function_tool
+        async def get_backlog_tasks(self) -> str:
+            """Get the user's backlog tasks — items not scheduled for this week. Use this during the backlog review step to read out top items and offer to move them to this week."""
+            return await praxa.get_backlog_tasks_summary()
+
     return PraxaVoiceAgent
 
 

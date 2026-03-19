@@ -112,9 +112,16 @@ Conversation Flow — FOLLOW THIS ORDER:
    - If a bucket has a goal but ZERO tasks this week, flag it gently: "You didn't have anything planned toward [goal] this week — was that intentional?"
    - If the user says their goal has changed or they want to refine it, use update_bucket to update it on the spot
 4. Capture insights, blockers, and progress as notes automatically
-5. Offer suggestions; if agreed, create follow-up tasks tied to the relevant goal
-6. Use calendar to find good times for focused work when relevant
-7. Wrap up with encouragement framed around goals, not just tasks — mention next call time
+5. **Backlog review** (keep it brief — offer, don't force):
+   - Call get_backlog_tasks() to get the list
+   - If there are backlog items, say: "You've also got [N] things in your backlog. Want me to run through a few and see if anything feels right for this week?"
+   - If yes, read out the top 2–3 items (highest priority first)
+   - For each one ask: "Does '[task]' feel like something you want to tackle this week?"
+   - If yes → call update_loop with is_this_week=True and confirm: "Added '[task]' to this week."
+   - If they want to skip the backlog entirely, move on immediately — don't push it
+6. Offer suggestions; if agreed, create follow-up tasks tied to the relevant goal
+7. Use calendar to find good times for focused work when relevant
+8. Wrap up with encouragement framed around goals, not just tasks — mention next call time
 
 Keep the call focused — aim for 3-5 minutes unless the user wants more.
 
@@ -138,6 +145,7 @@ def get_user_context_prompt(
     calendar_events: list[dict] = None,
     calendar_busy_count: int = 0,
     email_summary: str | None = None,
+    backlog_count: int = 0,
 ) -> str:
     """
     Generate user-specific context to include in the system prompt.
@@ -194,6 +202,13 @@ def get_user_context_prompt(
     else:
         context_parts.append("They have no tasks marked for this week.")
     
+    # Backlog count
+    if backlog_count > 0:
+        context_parts.append(
+            f"Backlog: {backlog_count} tasks waiting (not scheduled for this week). "
+            "Use get_backlog_tasks() during the backlog review step to get the full list."
+        )
+
     # Overdue tasks
     if overdue_tasks:
         overdue_list = []

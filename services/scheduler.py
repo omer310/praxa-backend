@@ -177,11 +177,130 @@ class CallScheduler:
         except Exception as e:
             logger.error(f"Error scheduling next call for user {user_id}: {e}")
 
+    async def _run_task_notifications(self):
+        """
+        Hourly job that sends daily task-related push notifications to users.
+
+        For each user with a push token, checks if it is currently 9–10am in their
+        local timezone. If so — and if no notification has been sent for them today —
+        it sends up to three summarised pushes:
+          1. Tasks due today  (task_due_soon)
+          2. Overdue tasks    (task_overdue)
+          3. Sprint ending today with open tasks  (sprint_deadline)
+
+        Uses an in-memory set to avoid duplicate sends within the same process run.
+        """
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        db = get_supabase_client()
+        users = await db.get_all_users_with_push_tokens()
+        if not users:
+            return
+
+        logger.info(f"[TaskNotifications] Checking {len(users)} users for daily task nudges")
+
+        for user in users:
+            user_id = user.get("user_id")
+            push_token = user.get("push_token")
+            timezone_str = user.get("timezone") or "UTC"
+
+            if not user_id or not push_token:
+                continue
+
+            try:
+                user_tz = ZoneInfo(timezone_str)
+            except (ZoneInfoNotFoundError, Exception):
+                user_tz = ZoneInfo("UTC")
+
+            now_local = datetime.now(user_tz)
+            today_key = f"{user_id}:{now_local.date().isoformat()}"
+
+            # Only send once per day, in the 9–10am window
+            if now_local.hour != 9:
+                continue
+            if today_key in self._notified_today:
+                continue
+
+            self._notified_today.add(today_key)
+
+            try:
+                # 1 — Tasks due today
+                due_today = await db.get_tasks_due_today(user_id, timezone_str)
+                if due_today:
+                    count = len(due_today)
+                    body = f"You have {count} task{'s' if count != 1 else ''} due today"
+                    ticket_id = await send_push_notification(
+                        push_token=push_token,
+                        title="Tasks due today",
+                        body=body,
+                        data={"type": "task_due_soon"},
+                    )
+                    if ticket_id:
+                        schedule_receipt_check(ticket_id, user_id)
+
+                # 2 — Overdue tasks
+                overdue = await db.get_overdue_tasks(user_id)
+                if overdue:
+                    count = len(overdue)
+                    body = f"You have {count} overdue task{'s' if count != 1 else ''}"
+                    ticket_id = await send_push_notification(
+                        push_token=push_token,
+                        title="Overdue tasks",
+                        body=body,
+                        data={"type": "task_overdue"},
+                    )
+                    if ticket_id:
+                        schedule_receipt_check(ticket_id, user_id)
+
+                # 3 — Sprint ending today
+                sprint_cadence = user.get("sprint_cadence") or "weekly"
+                last_reset_str = user.get("last_sprint_reset_at")
+                sprint_ends_today = self._is_sprint_end_today(
+                    now_local, sprint_cadence, last_reset_str
+                )
+                if sprint_ends_today:
+                    sprint_tasks = await db.get_this_week_tasks(user_id)
+                    if sprint_tasks:
+                        count = len(sprint_tasks)
+                        body = f"{count} task{'s' if count != 1 else ''} still open in this sprint"
+                        ticket_id = await send_push_notification(
+                            push_token=push_token,
+                            title="Sprint ending today",
+                            body=body,
+                            data={"type": "sprint_deadline"},
+                        )
+                        if ticket_id:
+                            schedule_receipt_check(ticket_id, user_id)
+
+                logger.info(f"[TaskNotifications] Sent daily nudges for user {user_id}")
+            except Exception as e:
+                logger.error(f"[TaskNotifications] Error processing user {user_id}: {e}")
+
+    def _is_sprint_end_today(
+        self, now_local: datetime, cadence: str, last_reset_str: Optional[str]
+    ) -> bool:
+        """Return True if today is the last day of the user's current sprint."""
+        try:
+            weekday = now_local.weekday()  # 0=Mon … 6=Sun
+            if cadence == "weekly":
+                return weekday == 6  # Sunday = last day of week
+            if cadence == "daily":
+                return True  # every day is the last day of a daily sprint
+            if cadence == "monthly":
+                import calendar
+                last_day = calendar.monthrange(now_local.year, now_local.month)[1]
+                return now_local.day == last_day
+        except Exception:
+            pass
+        return False
+
     def start(self):
         """Start the background scheduler."""
         if self._running:
             logger.warning("Scheduler already running")
             return
+
+        self._notified_today: set[str] = set()
         
         # Add the job to run every 5 minutes
         self.scheduler.add_job(
@@ -199,6 +318,15 @@ class CallScheduler:
             trigger=CronTrigger(hour=3, minute=0),
             id="consolidate_memories",
             name="Nightly memory consolidation",
+            replace_existing=True,
+        )
+
+        # Hourly job that sends task push notifications at 9am local time per user
+        self.scheduler.add_job(
+            self._run_task_notifications,
+            trigger=IntervalTrigger(hours=1),
+            id="task_notifications",
+            name="Daily task push notifications",
             replace_existing=True,
         )
         

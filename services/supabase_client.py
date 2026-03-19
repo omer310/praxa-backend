@@ -181,6 +181,63 @@ class SupabaseClient:
             logger.error(f"Error fetching overdue tasks: {e}")
             raise
 
+    async def get_backlog_tasks(self, user_id: str) -> list[dict]:
+        """Get backlog tasks (not scheduled for this week) for a user, sorted by priority."""
+        try:
+            response = self.client.table("loops").select(
+                "*, buckets(name, color)"
+            ).eq("user_id", user_id).eq("is_this_week", False).neq("status", "done").neq("view_tab", "completed").execute()
+
+            tasks = []
+            for task in response.data or []:
+                if task.get("buckets"):
+                    task["bucket_name"] = task["buckets"]["name"]
+                    task["bucket_color"] = task["buckets"]["color"]
+                    del task["buckets"]
+                tasks.append(task)
+
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            tasks.sort(key=lambda t: priority_order.get(t.get("priority", "medium"), 1))
+            return tasks
+        except Exception as e:
+            logger.error(f"Error fetching backlog tasks: {e}")
+            raise
+
+    async def get_tasks_due_today(self, user_id: str, timezone: str = "UTC") -> list[dict]:
+        """Get tasks with a due date of today in the user's local timezone."""
+        try:
+            from zoneinfo import ZoneInfo
+            user_tz = ZoneInfo(timezone)
+            today_local = datetime.now(user_tz).date()
+            today_start = f"{today_local.isoformat()}T00:00:00"
+            today_end = f"{today_local.isoformat()}T23:59:59"
+
+            response = self.client.table("loops").select(
+                "*, buckets(name)"
+            ).eq("user_id", user_id).neq("status", "done").gte("due_date", today_start).lte("due_date", today_end).execute()
+
+            tasks = []
+            for task in response.data or []:
+                if task.get("buckets"):
+                    task["bucket_name"] = task["buckets"]["name"]
+                    del task["buckets"]
+                tasks.append(task)
+            return tasks
+        except Exception as e:
+            logger.error(f"Error fetching tasks due today for user {user_id}: {e}")
+            return []
+
+    async def get_all_users_with_push_tokens(self) -> list[dict]:
+        """Get all users who have push tokens registered."""
+        try:
+            response = self.client.table("user_settings").select(
+                "user_id, push_token, timezone, sprint_cadence, last_sprint_reset_at"
+            ).not_.is_("push_token", "null").execute()
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error fetching users with push tokens: {e}")
+            return []
+
     async def get_recently_completed_tasks(self, user_id: str, days: int = 7) -> list[dict]:
         """
         Get recently completed tasks.
