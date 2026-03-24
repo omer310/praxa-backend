@@ -70,40 +70,42 @@ class CallScheduler:
     async def _process_scheduled_call(self, scheduled_call: dict):
         """
         Process a single scheduled call.
-        
-        Args:
-            scheduled_call: The scheduled call record with user info
+
+        Flow:
+          1. Mark as processing, increment attempt_count.
+          2. Validate user settings (calls enabled, phone verified).
+          3. Trigger the call via LiveKit/Twilio.
+             - Success: record stays in 'processing'; the Twilio status webhook
+               will advance it to next week (completed) or reset to pending (missed).
+             - Failure (exception or None result): retry up to max_attempts.
+               After exhausting attempts, advance the record to next week.
         """
         call_id = scheduled_call["id"]
         user_id = scheduled_call["user_id"]
         attempt_count = scheduled_call.get("attempt_count", 0)
         max_attempts = scheduled_call.get("max_attempts", 3)
-        
+
         db = get_supabase_client()
-        
+
         try:
-            # Mark as processing
             await db.update_scheduled_call(call_id, {
                 "status": "processing",
                 "last_attempt_at": datetime.utcnow().isoformat(),
-                "attempt_count": attempt_count + 1
+                "attempt_count": attempt_count + 1,
             })
-            
-            # Check if user still has calls enabled
+
             user_settings = scheduled_call.get("user_settings", {})
             if not user_settings.get("calls_enabled", True):
                 logger.info(f"Calls disabled for user {user_id}, skipping")
                 await db.update_scheduled_call(call_id, {"status": "skipped"})
                 return
-            
-            # Check if user has a verified phone number
+
             phone_number = user_settings.get("phone_number")
             if not phone_number or not user_settings.get("phone_verified", False):
                 logger.warning(f"No verified phone for user {user_id}, skipping")
                 await db.update_scheduled_call(call_id, {"status": "skipped"})
                 return
-            
-            # Only send push on the first attempt — not on retries
+
             if attempt_count == 0:
                 push_token = await get_user_push_token(user_id)
                 if push_token:
@@ -116,66 +118,28 @@ class CallScheduler:
                     if ticket_id:
                         schedule_receipt_check(ticket_id, user_id)
 
-            # Trigger the call
-            logger.info(f"Triggering call for user {user_id}")
+            logger.info(f"Triggering call for user {user_id} (attempt {attempt_count + 1}/{max_attempts})")
             result = await self.trigger_callback(user_id)
-            
-            # Schedule the next call for this user based on their checkin_schedule
-            if result:
-                try:
-                    await self._schedule_next_for_user(user_id, user_settings)
-                except Exception as e:
-                    logger.error(f"Failed to schedule next call for user {user_id}: {e}")
-            
-            # Note: The call log completion will be handled by the agent
-            # The scheduled_call will be marked complete when the call ends
-            
-        except Exception as e:
-            logger.error(f"Error processing scheduled call {call_id}: {e}")
-            
-            # Handle failure
-            if attempt_count + 1 >= max_attempts:
-                # Max attempts reached, mark as failed
-                await db.update_scheduled_call(call_id, {
-                    "status": "failed"
-                })
-                logger.warning(f"Scheduled call {call_id} failed after {max_attempts} attempts")
-            else:
-                # Reset to pending for retry
-                await db.update_scheduled_call(call_id, {
-                    "status": "pending"
-                })
-                logger.info(f"Scheduled call {call_id} will retry (attempt {attempt_count + 1}/{max_attempts})")
 
-    async def _schedule_next_for_user(self, user_id: str, user_settings: dict):
-        """
-        Schedule the next call for a user after completing the current one.
-        
-        Args:
-            user_id: The UUID of the user
-            user_settings: The user's settings including checkin_schedule
-        """
-        db = get_supabase_client()
-        
-        try:
-            checkin_schedule = user_settings.get("checkin_schedule", [])
-            checkin_enabled = user_settings.get("checkin_enabled", True)
-            timezone = user_settings.get("timezone", "America/New_York")
-            
-            if not checkin_enabled or not checkin_schedule:
-                logger.info(f"Checkins disabled or no schedule for user {user_id}")
-                return
-            
-            # Schedule the next call
-            await db.schedule_next_call(
-                user_id=user_id,
-                checkin_schedule=checkin_schedule,
-                timezone=timezone,
-                checkin_enabled=checkin_enabled
-            )
-            logger.info(f"Successfully scheduled next call for user {user_id}")
+            if not result:
+                raise Exception(f"Call initiation returned no result for user {user_id}")
+
+            logger.info(f"Call initiated for user {user_id} — scheduled_call {call_id} waiting for Twilio outcome")
+
         except Exception as e:
-            logger.error(f"Error scheduling next call for user {user_id}: {e}")
+            logger.error(f"Error initiating scheduled call {call_id}: {e}")
+
+            current_attempt = attempt_count + 1
+            if current_attempt >= max_attempts:
+                logger.warning(f"Scheduled call {call_id} exhausted {max_attempts} attempts, advancing to next week")
+                try:
+                    await db.advance_scheduled_call(call_id)
+                except Exception as advance_err:
+                    logger.error(f"Failed to advance scheduled call {call_id} after max attempts: {advance_err}")
+                    await db.update_scheduled_call(call_id, {"status": "failed"})
+            else:
+                await db.update_scheduled_call(call_id, {"status": "pending"})
+                logger.info(f"Scheduled call {call_id} will retry (attempt {current_attempt}/{max_attempts})")
 
     async def _run_task_notifications(self):
         """

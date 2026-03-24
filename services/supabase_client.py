@@ -675,10 +675,20 @@ class SupabaseClient:
                     "updated_at": datetime.utcnow().isoformat()
                 }
                 
-                response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
-                if response.data:
-                    created_calls.append(response.data[0])
-                    logger.info(f"Created scheduled call for {label} at {time_str} -> {next_call_utc.isoformat()} UTC")
+                try:
+                    response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
+                    if response.data:
+                        created_calls.append(response.data[0])
+                        logger.info(f"Created scheduled call for {label} at {time_str} -> {next_call_utc.isoformat()} UTC")
+                    else:
+                        logger.info(f"No data returned for {label} insert (may already exist), skipping")
+                except Exception as slot_err:
+                    err_str = str(slot_err).lower()
+                    if "duplicate" in err_str or "unique" in err_str or "23505" in err_str:
+                        logger.info(f"Active scheduled call already exists for user {user_id} at {next_call_utc.isoformat()}, skipping")
+                    else:
+                        logger.error(f"Error inserting scheduled call for {label}: {slot_err}")
+                        raise
             
             # Update user_settings with the earliest next scheduled call
             if created_calls:
@@ -706,16 +716,18 @@ class SupabaseClient:
             List of scheduled calls that are ready to be processed
         """
         try:
-            # Use timezone-aware datetime for PostgREST comparison
-            from datetime import timezone
-            now = datetime.now(timezone.utc).isoformat()
-            
-            logger.info(f"Querying scheduled_calls with now={now}")
-            
-            # Query scheduled_calls only (no JOIN needed)
+            from datetime import timezone, timedelta
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+            five_min_ago = (now - timedelta(minutes=5)).isoformat()
+
+            logger.info(f"Querying scheduled_calls with now={now_iso}")
+
             response = self.client.table("scheduled_calls").select(
                 "*"
-            ).eq("status", "pending").lte("scheduled_for", now).order("scheduled_for").execute()
+            ).eq("status", "pending").lte("scheduled_for", now_iso).or_(
+                f"last_attempt_at.is.null,last_attempt_at.lte.{five_min_ago}"
+            ).order("scheduled_for").execute()
             
             # For each scheduled call, fetch the user settings separately
             scheduled_calls = response.data or []
@@ -774,6 +786,59 @@ class SupabaseClient:
             "status": "completed",
             "call_log_id": call_log_id
         })
+
+    async def advance_scheduled_call(self, call_id: str) -> dict:
+        """
+        Advance a scheduled call to next week's occurrence, reusing the same record.
+        Resets attempt_count and last_attempt_at so it behaves like a fresh slot.
+        If a pending/processing record for next week already exists, marks this one completed instead.
+        """
+        from datetime import timezone as tz, timedelta
+
+        response = self.client.table("scheduled_calls").select("*").eq("id", call_id).execute()
+        if not response.data:
+            logger.error(f"Could not find scheduled_call {call_id} to advance")
+            return {}
+
+        record = response.data[0]
+        user_id = record["user_id"]
+        scheduled_for_raw = record["scheduled_for"]
+
+        scheduled_for = datetime.fromisoformat(scheduled_for_raw.replace(" ", "T"))
+        if scheduled_for.tzinfo is None:
+            scheduled_for = scheduled_for.replace(tzinfo=tz.utc)
+        next_week = scheduled_for + timedelta(days=7)
+        next_week_iso = next_week.isoformat()
+
+        conflict = self.client.table("scheduled_calls").select("id").eq(
+            "user_id", user_id
+        ).eq("scheduled_for", next_week_iso).in_("status", ["pending", "processing"]).execute()
+
+        if conflict.data:
+            logger.info(f"A record for next week already exists for user {user_id}, marking current call {call_id} as completed")
+            return await self.update_scheduled_call(call_id, {"status": "completed"})
+
+        logger.info(f"Advancing scheduled_call {call_id} for user {user_id} from {scheduled_for_raw} to {next_week_iso}")
+        return await self.update_scheduled_call(call_id, {
+            "scheduled_for": next_week_iso,
+            "status": "pending",
+            "attempt_count": 0,
+            "last_attempt_at": None,
+        })
+
+    async def get_processing_scheduled_call_for_user(self, user_id: str) -> Optional[dict]:
+        """
+        Find the most recently started processing scheduled call for a user.
+        Used by the Twilio webhook to locate the right record after a call ends.
+        """
+        try:
+            response = self.client.table("scheduled_calls").select("*").eq(
+                "user_id", user_id
+            ).eq("status", "processing").order("last_attempt_at", desc=True).limit(1).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"Error fetching processing scheduled call for user {user_id}: {e}")
+            return None
 
     async def calculate_next_call_time(
         self,

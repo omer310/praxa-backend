@@ -492,8 +492,31 @@ async def twilio_webhook(request: Request):
             await db.update_call_log(call_log["id"], updates)
             logger.info(f"Updated call log {call_log['id']} to status {our_status}")
 
-            # Send push notification for terminal statuses
+            # Update the scheduled_call record that triggered this call
             user_id = call_log.get("user_id")
+            if user_id and our_status in [
+                CallStatus.COMPLETED, CallStatus.FAILED,
+                CallStatus.NO_ANSWER, CallStatus.BUSY, CallStatus.CANCELED,
+            ]:
+                try:
+                    sc = await db.get_processing_scheduled_call_for_user(user_id)
+                    if sc:
+                        sc_id = sc["id"]
+                        sc_attempts = sc.get("attempt_count", 1)
+                        sc_max = sc.get("max_attempts", 3)
+                        if our_status == CallStatus.COMPLETED:
+                            await db.advance_scheduled_call(sc_id)
+                            logger.info(f"Call completed — advanced scheduled_call {sc_id} to next week")
+                        elif sc_attempts >= sc_max:
+                            await db.advance_scheduled_call(sc_id)
+                            logger.warning(f"Call missed after {sc_max} attempts — advanced scheduled_call {sc_id} to next week")
+                        else:
+                            await db.update_scheduled_call(sc_id, {"status": "pending"})
+                            logger.info(f"Call missed (attempt {sc_attempts}/{sc_max}) — scheduled_call {sc_id} reset for retry")
+                except Exception as sc_err:
+                    logger.error(f"Error updating scheduled_call after Twilio webhook for user {user_id}: {sc_err}")
+
+            # Send push notification for terminal statuses
             if user_id and our_status in [
                 CallStatus.COMPLETED, CallStatus.FAILED,
                 CallStatus.NO_ANSWER, CallStatus.BUSY, CallStatus.CANCELED,
@@ -674,38 +697,82 @@ async def sync_scheduled_calls(
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("user_id", user_id).eq("status", "pending").execute()
             
-            # Update hash
-            db.client.table("user_settings").update({
+            hash_update = db.client.table("user_settings").update({
                 "checkin_schedule_hash": current_hash,
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("user_id", user_id).execute()
-            
+            if not hash_update.data:
+                logger.error(f"Failed to persist checkin_schedule_hash (disabled) for user {user_id}")
+
             logger.info(f"Cancelled all pending calls for user {user_id} (checkin disabled or no schedule)")
             return {"success": True, "scheduled_calls": [], "count": 0}
         
-        # Schedule changed - cancel old and create new
+        # Schedule changed - cancel pending slots no longer in schedule, then upsert current slots
         logger.info(f"Schedule changed for user {user_id} (old: {stored_hash[:8] if stored_hash else 'none'}... new: {current_hash[:8]}...)")
-        
-        db.client.table("scheduled_calls").update({
-            "status": "cancelled",
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("user_id", user_id).eq("status", "pending").execute()
-        
-        # Create new scheduled calls
+
+        # Calculate UTC datetimes for all current schedule slots
+        from zoneinfo import ZoneInfo
+        from datetime import timedelta as _td
+        user_tz = ZoneInfo(timezone_str)
+        now_local = datetime.now(user_tz)
+        target_slots: list[str] = []
+        for entry in checkin_schedule:
+            day = entry.get("day")
+            time_str = entry.get("time")
+            if day is None or not time_str:
+                continue
+            try:
+                hour, minute = map(int, time_str.split(":"))
+            except (ValueError, AttributeError):
+                continue
+            target_weekday = 6 if day == 0 else day - 1
+            days_ahead = (target_weekday - now_local.weekday()) % 7
+            candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0) + _td(days=days_ahead)
+            if candidate <= now_local:
+                candidate += _td(days=7)
+            target_slots.append(candidate.astimezone(ZoneInfo("UTC")).isoformat())
+
+        # Cancel pending records whose slot is no longer in the schedule
+        existing_pending = db.client.table("scheduled_calls").select("id, scheduled_for").eq(
+            "user_id", user_id
+        ).eq("status", "pending").execute()
+
+        def _normalise_iso(s: str) -> str:
+            from datetime import timezone as _tz
+            dt = datetime.fromisoformat(s.replace(" ", "T"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            return dt.astimezone(_tz.utc).replace(microsecond=0).isoformat()
+
+        normalised_targets = {_normalise_iso(s) for s in target_slots}
+        ids_to_cancel = [
+            r["id"] for r in (existing_pending.data or [])
+            if _normalise_iso(r["scheduled_for"]) not in normalised_targets
+        ]
+        if ids_to_cancel:
+            db.client.table("scheduled_calls").update({
+                "status": "cancelled",
+                "updated_at": datetime.utcnow().isoformat()
+            }).in_("id", ids_to_cancel).execute()
+            logger.info(f"Cancelled {len(ids_to_cancel)} removed slots for user {user_id}")
+
+        # Create (or skip if already active) scheduled calls for current slots
         created_calls = await db.create_all_scheduled_calls(
             user_id=user_id,
             checkin_schedule=checkin_schedule,
             timezone=timezone_str,
             checkin_enabled=checkin_enabled
         )
-        
-        # Store new hash
-        db.client.table("user_settings").update({
+
+        # Store new hash and log if it failed
+        hash_update = db.client.table("user_settings").update({
             "checkin_schedule_hash": current_hash,
             "updated_at": datetime.utcnow().isoformat()
         }).eq("user_id", user_id).execute()
-        
-        logger.info(f"✅ Synced schedule for user {user_id}: {len(created_calls)} calls created")
+        if not hash_update.data:
+            logger.error(f"Failed to persist checkin_schedule_hash for user {user_id} — idempotency check will not work next sync")
+
+        logger.info(f"✅ Synced schedule for user {user_id}: {len(created_calls)} calls created/confirmed")
         
         return {
             "success": True,
