@@ -405,6 +405,13 @@ async def trigger_call(
     if not await db.is_ai_enabled(user_id):
         raise HTTPException(status_code=403, detail="AI features are disabled for this account")
 
+    allowed, used, limit = await db.check_and_record_voice_rate_limit(user_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Weekly voice call limit of {limit} reached ({used}/{limit} used). Resets after 7 days."
+        )
+
     # Trigger the call
     result = await trigger_call_for_user(user_id)
     

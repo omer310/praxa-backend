@@ -25,6 +25,10 @@ class SupabaseClient:
 
     # ==================== User & Settings ====================
 
+    VOICE_CALL_LIMITS = {"free": 3, "pro": -1}  # -1 = unlimited
+    VOICE_CALL_WINDOW_DAYS = 7
+    VOICE_FUNCTION_NAME = "voice-call"
+
     async def is_ai_enabled(self, user_id: str) -> bool:
         """Return False if the user's ai_enabled flag has been turned off by an admin."""
         try:
@@ -35,6 +39,45 @@ class SupabaseClient:
         except Exception as e:
             logger.warning(f"Could not check ai_enabled for user {user_id}: {e}")
             return True
+
+    async def check_and_record_voice_rate_limit(self, user_id: str) -> tuple[bool, int, int]:
+        """
+        Check if user is within their weekly voice call limit and record the call.
+        Returns (allowed, used, limit). limit=-1 means unlimited.
+        """
+        try:
+            user_resp = self.client.table("users").select("subscription_tier").eq("id", user_id).maybe_single().execute()
+            tier = user_resp.data.get("subscription_tier", "free") if user_resp and user_resp.data else "free"
+            limit = self.VOICE_CALL_LIMITS.get(tier, self.VOICE_CALL_LIMITS["free"])
+
+            if limit == -1:
+                self.client.table("function_rate_limits").insert({
+                    "user_id": user_id,
+                    "function_name": self.VOICE_FUNCTION_NAME,
+                }).execute()
+                return True, 0, -1
+
+            window_start = (datetime.utcnow() - timedelta(days=self.VOICE_CALL_WINDOW_DAYS)).isoformat()
+            count_resp = self.client.table("function_rate_limits").select(
+                "id", count="exact"
+            ).eq("user_id", user_id).eq("function_name", self.VOICE_FUNCTION_NAME).gte("called_at", window_start).execute()
+
+            used = count_resp.count if count_resp.count is not None else 0
+
+            if used >= limit:
+                logger.warning(f"Voice rate limit reached for user {user_id}: {used}/{limit} calls this week")
+                return False, used, limit
+
+            self.client.table("function_rate_limits").insert({
+                "user_id": user_id,
+                "function_name": self.VOICE_FUNCTION_NAME,
+            }).execute()
+
+            logger.info(f"Voice call recorded for user {user_id}: {used + 1}/{limit} this week")
+            return True, used + 1, limit
+        except Exception as e:
+            logger.warning(f"Could not check voice rate limit for user {user_id}: {e}")
+            return True, 0, -1
 
     async def get_user_with_settings(self, user_id: str) -> Optional[dict]:
         """
