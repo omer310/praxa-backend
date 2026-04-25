@@ -285,14 +285,9 @@ class CallScheduler:
             replace_existing=True,
         )
 
-        # Hourly job that sends task push notifications at 9am local time per user
-        self.scheduler.add_job(
-            self._run_task_notifications,
-            trigger=IntervalTrigger(hours=1),
-            id="task_notifications",
-            name="Daily task push notifications",
-            replace_existing=True,
-        )
+        # Daily task nudges are handled by the Supabase Edge Function
+        # send-daily-notifications (learned digest hour, multi-channel, dedupe).
+        # _run_task_notifications is kept for reference but not scheduled here.
         
         self.scheduler.start()
         self._running = True

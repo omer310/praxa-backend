@@ -844,10 +844,23 @@ Transcript:
                 if response.status_code != 200:
                     return "I couldn't access your email right now."
                 
-                messages = response.json().get("data", [])
+                all_messages = response.json().get("data", [])
+                if not all_messages:
+                    return "No recent emails found."
+
+                praxa_sender = os.getenv("SENDGRID_FROM_EMAIL", "").lower().strip()
+                messages = [
+                    m for m in all_messages
+                    if not (
+                        praxa_sender
+                        and praxa_sender in (
+                            (m.get("from") or [{}])[0].get("email", "")
+                        ).lower()
+                    )
+                ]
                 if not messages:
                     return "No recent emails found."
-                
+
                 unread = [m for m in messages if m.get("unread")]
                 
                 lines = []

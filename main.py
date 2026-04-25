@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -555,6 +555,65 @@ async def twilio_webhook(request: Request):
         logger.error(f"Error processing Twilio webhook: {e}")
         # Still return 200 to prevent Twilio retries
         return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.post("/webhook/twilio/inbound-sms")
+@limiter.limit("60/minute")
+async def twilio_inbound_sms(request: Request):
+    """
+    Twilio Messaging webhook for inbound SMS replies.
+
+    Twilio sends a POST with form fields when a user replies to one of our
+    outbound SMS notifications.  We look up the sender, run the AI reply
+    processor, and return TwiML so Twilio delivers our response back to them.
+
+    Configure this URL in the Twilio console under the Messaging Service
+    (or phone number) → "A message comes in" webhook.
+    """
+    from services.reply_processor import lookup_user_by_phone, process_reply as _process_reply
+
+    def _twiml(msg: str) -> Response:
+        safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f"<Response><Message>{safe}</Message></Response>"
+        )
+        return Response(content=xml, media_type="application/xml")
+
+    try:
+        form = await request.form()
+        from_number: str = form.get("From", "")
+        body: str = (form.get("Body") or "").strip()
+
+        if not from_number or not body:
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                media_type="application/xml",
+            )
+
+        logger.info(f"[InboundSMS] from={from_number} body_len={len(body)}")
+
+        user_id = await lookup_user_by_phone(from_number)
+        if not user_id:
+            logger.warning(f"[InboundSMS] Unrecognized number: {from_number}")
+            return _twiml(
+                "We couldn't match your number to a Praxa account. "
+                "Open the app to manage your tasks."
+            )
+
+        reply = await _process_reply(
+            user_id=user_id,
+            channel="sms",
+            raw_message=body,
+        )
+        return _twiml(reply)
+
+    except Exception as exc:
+        logger.error(f"[InboundSMS] Unhandled error: {exc}")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            media_type="application/xml",
+        )
 
 
 @app.get("/scheduled-calls")

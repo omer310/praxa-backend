@@ -21,6 +21,9 @@ slowapi>=0.1.9  # Rate limiting
 # Background tasks
 apscheduler>=3.10.0
 
+# OpenAI SDK (used directly by reply_processor)
+openai>=1.0.0
+
 # Utilities
 python-dotenv>=1.0.0
 httpx>=0.26.0
