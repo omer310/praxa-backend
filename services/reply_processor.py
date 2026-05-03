@@ -26,6 +26,8 @@ Reply with valid JSON only, no markdown.
 Resolution rules:
 - "done", "finished", "completed": complete_task. If exactly one task was in the notification, \
 use that task. If multiple, pick the best match from the message.
+- Partial progress in any domain, like "made progress", "started it", "did some of it", \
+"hit part of the target", "not finished yet": partial_progress. Do NOT complete the task; capture the progress note and ask whether to finish later, resize, or break it down.
 - "snooze", "push", "move", "later", "reschedule [task]": snooze_task. Parse relative dates \
 (tomorrow={tomorrow}, Friday={next_friday}, next week={next_monday}) into YYYY-MM-DD.
 - "cancel [call]", "skip [call]", "not today": reschedule_call.
@@ -40,12 +42,13 @@ CRITICAL rules for reply_message:
 "Which task? Reply with the name."
 - Keep replies under 160 chars for SMS. Be warm and direct.
 - On success, confirm exactly what happened: "Done -- 'Client deck' marked complete."
+- On partial_progress, acknowledge progress and ask one short adjustment question, e.g. "Noted progress on that. Finish later, resize it, or split it up?"
 - On get_status, list the tasks inline — don't just say "you have tasks".
 
 {{
-  "intent": "complete_task|snooze_task|add_task|reschedule_call|get_status|acknowledge|stop_notifications|unknown",
+  "intent": "complete_task|partial_progress|snooze_task|add_task|reschedule_call|get_status|acknowledge|stop_notifications|unknown",
   "confidence": <0.0-1.0>,
-  "params": {{}},
+  "params": {{"task_id": "<optional>", "best_match_title": "<optional>", "progress_note": "<optional summary of what happened>"}},
   "reply_message": "<self-contained reply>"
 }}
 """
@@ -172,7 +175,7 @@ async def _validate_context(
     stale_threshold = 6.0 if channel == "sms" else 48.0
     is_stale = age_hours is not None and age_hours > stale_threshold
 
-    if intent in ("complete_task", "snooze_task"):
+    if intent in ("complete_task", "partial_progress", "snooze_task"):
         hint = params.get("task_id") or params.get("best_match_title", "")
         if hint and not _find_task(open_tasks, hint):
             try:
@@ -196,15 +199,15 @@ async def _validate_context(
                     False,
                     "It looks like things may have changed since that notification — "
                     "that task no longer appears in your open list. "
-                    "Open Praxa to see your current tasks.",
+                    "Reply 'status' to see your current tasks.",
                 )
-            return False, "I couldn't find that task in your open list. Open Praxa to check your tasks."
+            return False, "I couldn't find that task in your open list. Reply 'status' to see your tasks."
 
     if intent == "reschedule_call" and not upcoming_call:
         return (
             False,
             "I couldn't find a pending call to reschedule — it may have already "
-            "been completed or cancelled. Open Praxa to schedule a new one.",
+            "been completed or cancelled. Reply with a new time if you want to schedule one.",
         )
 
     return True, ""
@@ -311,7 +314,7 @@ async def _parse_intent(message: str, user_context: dict, channel: str) -> dict:
             "intent": "unknown",
             "confidence": 0.0,
             "params": {},
-            "reply_message": "Got it! Open the Praxa app to manage your tasks.",
+            "reply_message": "Got it. Reply 'status' to see your tasks or send a task update.",
         }
 
 
@@ -327,6 +330,24 @@ def _find_task(tasks: list[dict], hint: str) -> Optional[dict]:
         if hint_lower in t["title"].lower():
             return t
     return None
+
+
+def _append_task_note(user_id: str, task_id: str, note: str, source: str) -> None:
+    """Append a Praxa-authored note to a task without changing its completion state."""
+    db = get_supabase_client()
+    existing = db.client.table("loops").select("notes").eq(
+        "id", task_id
+    ).eq("user_id", user_id).single().execute()
+
+    existing_notes = existing.data.get("notes", "") if existing.data else ""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    note_line = f"[{timestamp} - Praxa {source}] {note}"
+    new_notes = f"{existing_notes}\n\n{note_line}" if existing_notes else note_line
+
+    db.client.table("loops").update({
+        "notes": new_notes,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", task_id).eq("user_id", user_id).execute()
 
 
 async def _execute(
@@ -361,6 +382,22 @@ async def _execute(
                 {"status": "completed", "updated_at": datetime.utcnow().isoformat()}
             ).eq("id", task["id"]).eq("user_id", user_id).execute()
             return "task_completed", {"task_id": task["id"], "title": task["title"]}, None
+
+        if intent == "partial_progress":
+            hint = params.get("task_id") or params.get("best_match_title", "")
+            task = _find_task(open_tasks, hint)
+            if not task:
+                return "task_not_found", {"hint": hint}, None
+
+            progress_note = params.get("progress_note", "").strip()
+            if not progress_note:
+                progress_note = "User reported partial progress via reply; task remains open."
+            _append_task_note(user_id, task["id"], progress_note, channel.upper())
+            return "partial_progress_noted", {
+                "task_id": task["id"],
+                "title": task["title"],
+                "progress_note": progress_note,
+            }, None
 
         if intent == "snooze_task":
             hint = params.get("task_id") or params.get("best_match_title", "")
@@ -464,7 +501,7 @@ async def process_reply(
 
     intent: str = parsed.get("intent", "unknown")
     reply: str = parsed.get(
-        "reply_message", "Got it! Open the Praxa app to manage your tasks."
+        "reply_message", "Got it. Reply 'status' to see your tasks or send a task update."
     )
 
     action_taken, action_result, override_reply = await _execute(
@@ -473,6 +510,11 @@ async def process_reply(
 
     if override_reply:
         reply = override_reply
+    elif action_taken == "partial_progress_noted":
+        title = action_result.get("title", "that task")
+        reply = f"Noted progress on '{title}'. Finish later, lower target, or split it up?"
+        if len(reply) > 160:
+            reply = reply[:157] + "..."
     elif action_taken == "get_status":
         summary: str = action_result.get("summary", "No open tasks")
         reply = f"Your open tasks: {summary}"
@@ -518,5 +560,3 @@ async def lookup_user_by_phone(from_number: str) -> Optional[str]:
     except Exception as exc:
         logger.error(f"[ReplyProcessor] Phone lookup failed: {exc}")
     return None
-
-

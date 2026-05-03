@@ -4,7 +4,7 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, time
 from typing import Optional
 from uuid import UUID
 import json
@@ -187,11 +187,14 @@ class PraxaAgent:
             raise
 
     async def _load_calendar_context(self):
-        """Load calendar events for the upcoming week."""
+        """Load Nylas calendar events for the next two weeks."""
         if not NYLAS_API_KEY or not self.calendar_grant_id:
             return
         
         try:
+            now = datetime.now()
+            window_end = now + timedelta(days=14)
+
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # Get primary calendar
                 calendars_url = f"https://api.us.nylas.com/v3/grants/{self.calendar_grant_id}/calendars"
@@ -213,7 +216,8 @@ class PraxaAgent:
                 
                 calendar_id = calendars[0].get("id")
                 
-                # Get events for next 7 days
+                # Get events for the next 14 days. Nylas v3 Events API requires
+                # calendar_id and supports Unix timestamp start/end filters.
                 events_url = f"https://api.us.nylas.com/v3/grants/{self.calendar_grant_id}/events"
                 events_response = await client.get(
                     events_url,
@@ -221,7 +225,12 @@ class PraxaAgent:
                         "Authorization": f"Bearer {NYLAS_API_KEY}",
                         "Accept": "application/json"
                     },
-                    params={"calendar_id": calendar_id, "limit": 50}
+                    params={
+                        "calendar_id": calendar_id,
+                        "start": int(now.timestamp()),
+                        "end": int(window_end.timestamp()),
+                        "limit": 200,
+                    }
                 )
                 
                 if events_response.status_code == 200:
@@ -685,6 +694,92 @@ Transcript:
             logger.error(f"Error getting today's calendar: {e}")
             return "I had trouble getting today's events."
 
+    def _parse_calendar_time(self, value) -> Optional[datetime]:
+        """Parse a Nylas event time from epoch seconds or ISO text."""
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (int, float)):
+                return datetime.fromtimestamp(value)
+            if isinstance(value, str):
+                if value.isdigit():
+                    return datetime.fromtimestamp(int(value))
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+        return None
+
+    async def find_focus_time(self, duration_minutes: int = 60) -> str:
+        """Find realistic open work blocks from the user's Nylas calendar events."""
+        if not self.calendar_grant_id:
+            return "I don't have access to your calendar right now."
+
+        try:
+            duration_minutes = max(15, min(duration_minutes or 60, 240))
+            now = datetime.now()
+            today = now.date()
+            window_end = today + timedelta(days=14)
+            busy_by_day: dict = {}
+
+            for event in self.calendar_events:
+                when = event.get("when", {})
+                start = self._parse_calendar_time(when.get("start_time") or when.get("date"))
+                end = self._parse_calendar_time(when.get("end_time") or when.get("end_date"))
+                if not start:
+                    continue
+                if not end:
+                    end = start + timedelta(hours=1)
+                if start.date() < today or start.date() > window_end:
+                    continue
+                busy_by_day.setdefault(start.date(), []).append((start, end))
+
+            suggestions = []
+            for offset in range(0, 15):
+                day = today + timedelta(days=offset)
+                if day.weekday() >= 5:
+                    continue
+
+                day_start = datetime.combine(day, time(9, 0))
+                day_end = datetime.combine(day, time(17, 0))
+                cursor = max(day_start, now + timedelta(minutes=30)) if day == today else day_start
+                events = sorted(busy_by_day.get(day, []), key=lambda item: item[0])
+
+                for event_start, event_end in events:
+                    if event_end <= cursor:
+                        continue
+                    if event_start > cursor:
+                        gap_minutes = int((event_start - cursor).total_seconds() / 60)
+                        if gap_minutes >= duration_minutes:
+                            suggestions.append(cursor)
+                            break
+                    cursor = max(cursor, event_end)
+                    if cursor >= day_end:
+                        break
+
+                if len(suggestions) >= 3:
+                    break
+                if cursor < day_end:
+                    gap_minutes = int((day_end - cursor).total_seconds() / 60)
+                    if gap_minutes >= duration_minutes:
+                        suggestions.append(cursor)
+                if len(suggestions) >= 3:
+                    break
+
+            if not suggestions:
+                return "I don't see a clean opening in the next two weeks. Want me to help reduce the scope or move something lower priority?"
+
+            formatted = []
+            for slot in suggestions[:3]:
+                day_label = "today" if slot.date() == today else slot.strftime("%A")
+                time_label = slot.strftime("%#I:%M %p") if os.name == "nt" else slot.strftime("%-I:%M %p")
+                formatted.append(f"{day_label} at {time_label}")
+
+            return "I found these realistic openings: " + "; ".join(formatted) + "."
+
+        except Exception as e:
+            logger.error(f"Error finding focus time: {e}")
+            return "I had trouble finding an open calendar slot."
+
     async def update_bucket(self, bucket_name: str, goal: Optional[str] = None, description: Optional[str] = None) -> str:
         """Update a bucket's goal or description."""
         try:
@@ -952,6 +1047,15 @@ def create_praxa_agent_class(praxa: PraxaAgent):
         async def get_todays_calendar(self) -> str:
             """Get today's calendar events. Use when user asks about today's schedule."""
             return await praxa.get_todays_calendar()
+
+        @function_tool
+        async def find_focus_time(duration_minutes: int = 60) -> str:
+            """Find realistic open work blocks from the user's Nylas calendar. Use proactively when a task slipped because of timing, schedule, energy, or competing commitments.
+
+            Args:
+                duration_minutes: How long the task or focus block should be, from 15 to 240 minutes.
+            """
+            return await praxa.find_focus_time(duration_minutes)
 
         @function_tool
         async def update_bucket(self, bucket_name: str, goal: Optional[str] = None, description: Optional[str] = None) -> str:
