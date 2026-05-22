@@ -239,7 +239,11 @@ Return ONLY valid JSON array."""
             parsed = json.loads(raw)
             consolidated = parsed if isinstance(parsed, list) else parsed.get("facts", [])
         except Exception:
-            logger.warning("[Memory] Could not parse consolidation response")
+            logger.warning("[Memory] Could not parse consolidation response — keeping existing facts")
+            return
+
+        if not consolidated:
+            logger.warning("[Memory] Consolidation returned empty list — keeping existing facts to avoid data loss")
             return
 
         db.table("user_facts").delete().eq("user_id", user_id).execute()

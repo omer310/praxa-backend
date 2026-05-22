@@ -89,12 +89,14 @@ class PraxaAgent:
         calendar_grant_id: Optional[str] = None,
         email_grant_id: Optional[str] = None,
         is_in_app: bool = False,
+        panel_session_id: Optional[str] = None,
     ):
         self.user_id = user_id
         self.call_log_id = call_log_id
         self.calendar_grant_id = calendar_grant_id
         self.email_grant_id = email_grant_id
         self.is_in_app = is_in_app
+        self.panel_session_id = panel_session_id
         self.db = get_supabase_client()
         
         # Call tracking
@@ -360,6 +362,7 @@ class PraxaAgent:
                         transcript=self.transcript,
                         summary="",
                         duration=duration,
+                        session_id=self.panel_session_id,
                     )
                 except Exception as e:
                     logger.error(f"Error saving in-app session memory: {e}")
@@ -440,7 +443,6 @@ class PraxaAgent:
                 f"{len(self.tasks_created)} created"
             )
 
-            # Extract and store session memory (non-blocking)
             asyncio.create_task(
                 extract_and_store_session_memory(
                     user_id=self.user_id,
@@ -448,7 +450,7 @@ class PraxaAgent:
                     transcript=self.transcript,
                     summary=summary,
                     duration=duration,
-                    session_id=self.call_log_id,
+                    session_id=self.panel_session_id or self.call_log_id,
                 )
             )
             
@@ -1181,6 +1183,7 @@ async def entrypoint(ctx: JobContext):
         phone_number   = _get("phone_number", "phoneNumber")
         calendar_grant_id = _get("calendar_grant_id", "calendarGrantId")
         email_grant_id = _get("email_grant_id", "emailGrantId")
+        panel_session_id = _get("session_id", "sessionId")
 
         # Fallback: parse room name for phone call rooms (praxa-call-{user_id}-{call_log_id})
         if not user_id:
@@ -1220,6 +1223,7 @@ async def entrypoint(ctx: JobContext):
         calendar_grant_id=calendar_grant_id,
         email_grant_id=email_grant_id,
         is_in_app=is_in_app,
+        panel_session_id=panel_session_id,
     )
     _current_agent = praxa
     
