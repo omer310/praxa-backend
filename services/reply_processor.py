@@ -295,7 +295,7 @@ async def _parse_intent(message: str, user_context: dict, channel: str) -> dict:
     )
     try:
         resp = await openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": message},

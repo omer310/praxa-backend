@@ -480,7 +480,7 @@ Transcript:
             
             openai_client = openai_api.OpenAI()
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5.4-mini",
                 messages=[{"role": "user", "content": summary_prompt}],
                 max_tokens=200
             )
@@ -1253,7 +1253,7 @@ async def entrypoint(ctx: JobContext):
         stt = deepgram.STT()
         logger.info("Deepgram STT initialized")
         
-        llm_instance = openai.LLM(model="gpt-4o")
+        llm_instance = openai.LLM(model="gpt-4.1")
         logger.info("OpenAI LLM initialized")
         
         eleven_api_key = os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
