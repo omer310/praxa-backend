@@ -56,6 +56,7 @@ LIVEKIT_SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
 
 from services.supabase_client import get_supabase_client
 from services.memory_service import extract_and_store_session_memory, load_session_context
+from services.skill_service import extract_skills_from_session
 from agent.prompts import (
     SYSTEM_PROMPT, IN_APP_SYSTEM_PROMPT,
     get_user_context_prompt, get_opening_message, get_in_app_opening_message, get_closing_message,
@@ -126,6 +127,9 @@ class PraxaAgent:
         # Memory context (loaded at session start)
         self.session_context: str = ""
 
+        # Agent skills (loaded at session start)
+        self.skills: list[dict] = []
+
     async def load_user_context(self):
         """Load all user data needed for the conversation."""
         try:
@@ -158,7 +162,14 @@ class PraxaAgent:
             except Exception as e:
                 logger.warning(f"Could not load memory context: {e}")
                 self.session_context = ""
-            
+
+            # Load agent skills
+            try:
+                await self.load_user_skills()
+            except Exception as e:
+                logger.warning(f"Could not load agent skills: {e}")
+                self.skills = []
+
             # Load calendar if grant ID available
             if self.calendar_grant_id:
                 try:
@@ -187,6 +198,16 @@ class PraxaAgent:
         except Exception as e:
             logger.error(f"Error loading user context: {e}")
             raise
+
+    async def load_user_skills(self):
+        """Load active agent skills for this user."""
+        resp = self.db.client.table("user_agent_skills") \
+            .select("name, content, category") \
+            .eq("user_id", self.user_id) \
+            .eq("status", "active") \
+            .order("created_at") \
+            .execute()
+        self.skills = resp.data or []
 
     async def _load_calendar_context(self):
         """Load Nylas calendar events for the next two weeks."""
@@ -268,7 +289,16 @@ class PraxaAgent:
         
         base_prompt = IN_APP_SYSTEM_PROMPT if self.is_in_app else SYSTEM_PROMPT
         memory_section = f"\n\n{self.session_context}" if self.session_context else ""
-        return f"{base_prompt}\n\n--- USER CONTEXT ---\n{context_prompt}{memory_section}"
+
+        skills_section = ""
+        if self.skills:
+            skills_lines = ["\n\n## Agent Skills"]
+            for skill in self.skills:
+                category_tag = f" [{skill['category']}]" if skill.get("category") else ""
+                skills_lines.append(f"\n### {skill['name']}{category_tag}\n{skill['content']}")
+            skills_section = "".join(skills_lines)
+
+        return f"{base_prompt}\n\n--- USER CONTEXT ---\n{context_prompt}{memory_section}{skills_section}"
 
     def _get_opening_message(self) -> str:
         """Get the opening message."""
@@ -364,6 +394,13 @@ class PraxaAgent:
                         duration=duration,
                         session_id=self.panel_session_id,
                     )
+                    asyncio.create_task(
+                        extract_skills_from_session(
+                            user_id=self.user_id,
+                            transcript=self.transcript,
+                            surface="voice",
+                        )
+                    )
                 except Exception as e:
                     logger.error(f"Error saving in-app session memory: {e}")
             return
@@ -451,6 +488,13 @@ class PraxaAgent:
                     summary=summary,
                     duration=duration,
                     session_id=self.panel_session_id or self.call_log_id,
+                )
+            )
+            asyncio.create_task(
+                extract_skills_from_session(
+                    user_id=self.user_id,
+                    transcript=self.transcript,
+                    surface="phone",
                 )
             )
             

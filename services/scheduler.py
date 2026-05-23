@@ -285,6 +285,24 @@ class CallScheduler:
             replace_existing=True,
         )
 
+        # Add nightly skill proposals at 3:30am UTC (after memory consolidation)
+        self.scheduler.add_job(
+            self._run_skill_proposals,
+            trigger=CronTrigger(hour=3, minute=30),
+            id="propose_skills",
+            name="Nightly agent skills proposal",
+            replace_existing=True,
+        )
+
+        # Add nightly skill consolidation at 3:45am UTC (after proposals)
+        self.scheduler.add_job(
+            self._run_skill_consolidation,
+            trigger=CronTrigger(hour=3, minute=45),
+            id="consolidate_skills",
+            name="Nightly agent skills consolidation",
+            replace_existing=True,
+        )
+
         # Daily task nudges are handled by the Supabase Edge Function
         # send-daily-notifications (learned digest hour, multi-channel, dedupe).
         # _run_task_notifications is kept for reference but not scheduled here.
@@ -302,6 +320,26 @@ class CallScheduler:
             logger.info("[Scheduler] Nightly memory consolidation complete")
         except Exception as e:
             logger.error(f"[Scheduler] Memory consolidation failed: {e}", exc_info=True)
+
+    async def _run_skill_proposals(self):
+        """Run nightly agent skill proposals for all users."""
+        try:
+            from services.skill_service import propose_skills_for_all_users
+            logger.info("[Scheduler] Starting nightly skill proposals")
+            await propose_skills_for_all_users()
+            logger.info("[Scheduler] Nightly skill proposals complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Skill proposals failed: {e}", exc_info=True)
+
+    async def _run_skill_consolidation(self):
+        """Run nightly agent skill consolidation/deduplication for all users."""
+        try:
+            from services.skill_service import consolidate_skills_for_all_users
+            logger.info("[Scheduler] Starting nightly skill consolidation")
+            await consolidate_skills_for_all_users()
+            logger.info("[Scheduler] Nightly skill consolidation complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Skill consolidation failed: {e}", exc_info=True)
 
     def stop(self):
         """Stop the background scheduler."""

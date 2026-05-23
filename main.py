@@ -978,6 +978,39 @@ async def save_session_memory(
         raise HTTPException(status_code=500, detail="Failed to save session memory")
 
 
+class ExtractSkillsRequest(PydanticBase):
+    user_id: str
+    surface: str
+    messages: list
+    session_id: Optional[str] = None
+
+
+@app.post("/extract-skills")
+async def extract_skills(
+    request_body: ExtractSkillsRequest,
+    background_tasks: BackgroundTasks,
+    req: Request,
+):
+    """
+    Extract behavioral skills from a conversation and store them.
+    Called fire-and-forget by praxa-chat edge function after substantial conversations.
+    """
+    try:
+        from services.memory_service import extract_skills_from_session
+
+        background_tasks.add_task(
+            extract_skills_from_session,
+            user_id=request_body.user_id,
+            transcript=request_body.messages,
+            surface=request_body.surface,
+        )
+
+        return {"status": "queued", "user_id": request_body.user_id}
+    except Exception as e:
+        logger.error(f"Error queuing skill extraction: {e}")
+        raise HTTPException(status_code=500, detail="Failed to extract skills")
+
+
 # ==================== Run Server ====================
 
 if __name__ == "__main__":
