@@ -97,7 +97,7 @@ Agent Skills:
 Return ONLY valid JSON."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": consolidation_prompt}],
             temperature=0.2,
             response_format={"type": "json_object"},
@@ -227,7 +227,7 @@ User facts:
 Return ONLY valid JSON."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             response_format={"type": "json_object"},

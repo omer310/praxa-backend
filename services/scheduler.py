@@ -3,7 +3,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Callable, Awaitable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -90,7 +90,7 @@ class CallScheduler:
         try:
             await db.update_scheduled_call(call_id, {
                 "status": "processing",
-                "last_attempt_at": datetime.utcnow().isoformat(),
+                "last_attempt_at": datetime.now(timezone.utc).isoformat(),
                 "attempt_count": attempt_count + 1,
             })
 
@@ -275,8 +275,67 @@ class CallScheduler:
             replace_existing=True
         )
 
-        # Add daily memory consolidation at 3am UTC
+        # Action dispatcher safety-net poll: picks up actions queued by any
+        # surface (incl. the out-of-process voice agent) and confirmed actions.
+        self.scheduler.add_job(
+            self._run_action_dispatcher,
+            trigger=IntervalTrigger(seconds=30),
+            id="dispatch_pending_actions",
+            name="Dispatch pending integration actions",
+            replace_existing=True,
+        )
+
+        # Integration context enrichment: fetch content + embeddings for newly
+        # synced Notion rows (n8n does the lightweight metadata pass).
+        self.scheduler.add_job(
+            self._run_integration_ingest,
+            trigger=IntervalTrigger(minutes=10),
+            id="enrich_integration_context",
+            name="Enrich integration context with embeddings",
+            replace_existing=True,
+        )
+
         from apscheduler.triggers.cron import CronTrigger
+
+        # Proactive daily briefing: runs hourly, fires per-user at their local
+        # BRIEFING_HOUR. Kill-switch PROACTIVE_BRIEFING_ENABLED (default on).
+        self.scheduler.add_job(
+            self._run_daily_briefing,
+            trigger=CronTrigger(minute=10),
+            id="daily_briefing",
+            name="Proactive daily briefing",
+            replace_existing=True,
+        )
+
+        # Proactive initiative loop: scans for attention emails without a draft
+        # and queues confirm-only reply drafts. Kill-switch PROACTIVE_LOOP_ENABLED.
+        self.scheduler.add_job(
+            self._run_initiative_loop,
+            trigger=IntervalTrigger(minutes=20),
+            id="initiative_loop",
+            name="Proactive initiative loop",
+            replace_existing=True,
+        )
+
+        # Relationship linker: refresh VIP + link contacts to Notion/Slack daily.
+        self.scheduler.add_job(
+            self._run_relationship_linker,
+            trigger=CronTrigger(hour=4, minute=20),
+            id="relationship_linker",
+            name="Relationship graph linker",
+            replace_existing=True,
+        )
+
+        # Follow-up detector: nudge users about unanswered threads and due tasks.
+        self.scheduler.add_job(
+            self._run_follow_up_detector,
+            trigger=CronTrigger(hour=4, minute=30),
+            id="follow_up_detector",
+            name="Daily follow-up detector",
+            replace_existing=True,
+        )
+
+        # Add daily memory consolidation at 3am UTC
         self.scheduler.add_job(
             self._run_memory_consolidation,
             trigger=CronTrigger(hour=3, minute=0),
@@ -303,13 +362,90 @@ class CallScheduler:
             replace_existing=True,
         )
 
+        # Background reasoning agent: LLM pass over world state every 30 min.
+        self.scheduler.add_job(
+            self._run_background_agent,
+            trigger=IntervalTrigger(minutes=30),
+            id="background_reasoning_agent",
+            name="Background reasoning agent",
+            replace_existing=True,
+        )
+
+        # Autonomy learner: daily job to propose user_autonomy_rules from
+        # approval patterns recorded in action_approval_log.
+        self.scheduler.add_job(
+            self._run_autonomy_learner,
+            trigger=CronTrigger(hour=5, minute=0),
+            id="autonomy_learner",
+            name="Autonomy pattern learner",
+            replace_existing=True,
+        )
+
+        # World state safety-net refresh: rebuild snapshots for all users.
+        self.scheduler.add_job(
+            self._run_world_state_refresh,
+            trigger=IntervalTrigger(minutes=30),
+            id="world_state_refresh",
+            name="World state snapshot refresh",
+            replace_existing=True,
+        )
+
         # Daily task nudges are handled by the Supabase Edge Function
         # send-daily-notifications (learned digest hour, multi-channel, dedupe).
         # _run_task_notifications is kept for reference but not scheduled here.
-        
+
         self.scheduler.start()
         self._running = True
         logger.info("Call scheduler started (checking every 5 minutes)")
+
+    async def _run_action_dispatcher(self):
+        """Poll the integration_actions queue and dispatch any due actions."""
+        try:
+            from services.action_dispatcher import run_due_actions, notify_pending_approvals
+            await notify_pending_approvals()
+            await run_due_actions()
+        except Exception as e:
+            logger.error(f"[Scheduler] Action dispatcher poll failed: {e}", exc_info=True)
+
+    async def _run_integration_ingest(self):
+        """Enrich newly synced integration_context rows with content + embeddings."""
+        try:
+            from services.integration_ingest import enrich_integration_context
+            await enrich_integration_context()
+        except Exception as e:
+            logger.error(f"[Scheduler] Integration ingest failed: {e}", exc_info=True)
+
+    async def _run_daily_briefing(self):
+        """Generate per-user daily briefs at their local BRIEFING_HOUR."""
+        try:
+            from services.briefing import run_daily_briefing
+            await run_daily_briefing()
+        except Exception as e:
+            logger.error(f"[Scheduler] Daily briefing failed: {e}", exc_info=True)
+
+    async def _run_initiative_loop(self):
+        """Scan attention emails and queue confirm-only reply drafts."""
+        try:
+            from services.initiative_loop import run_initiative_loop
+            await run_initiative_loop()
+        except Exception as e:
+            logger.error(f"[Scheduler] Initiative loop failed: {e}", exc_info=True)
+
+    async def _run_relationship_linker(self):
+        """Refresh VIP status and link contacts to Notion/Slack identities."""
+        try:
+            from services.relationship_linker import run_relationship_linker
+            await run_relationship_linker()
+        except Exception as e:
+            logger.error(f"[Scheduler] Relationship linker failed: {e}", exc_info=True)
+
+    async def _run_follow_up_detector(self):
+        """Run daily follow-up detection: unanswered threads + due-soon tasks."""
+        try:
+            from services.follow_up_detector import run_follow_up_detector
+            await run_follow_up_detector()
+        except Exception as e:
+            logger.error(f"[Scheduler] Follow-up detector failed: {e}", exc_info=True)
 
     async def _run_memory_consolidation(self):
         """Run nightly memory consolidation for all users."""
@@ -340,6 +476,43 @@ class CallScheduler:
             logger.info("[Scheduler] Nightly skill consolidation complete")
         except Exception as e:
             logger.error(f"[Scheduler] Skill consolidation failed: {e}", exc_info=True)
+
+    async def _run_background_agent(self):
+        """Run a proactive reasoning pass for all active users."""
+        try:
+            from services.background_agent import run_reasoning_pass_all_users
+            await run_reasoning_pass_all_users()
+        except Exception as e:
+            logger.error(f"[Scheduler] Background agent failed: {e}", exc_info=True)
+
+    async def _run_autonomy_learner(self):
+        """Daily scan of action_approval_log to propose user_autonomy_rules."""
+        try:
+            from services.autonomy_learner import learn_autonomy_patterns_all_users
+            logger.info("[Scheduler] Starting autonomy pattern learning")
+            await learn_autonomy_patterns_all_users()
+            logger.info("[Scheduler] Autonomy learning complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Autonomy learner failed: {e}", exc_info=True)
+
+    async def _run_world_state_refresh(self):
+        """Refresh world state snapshots for all users (safety-net pass)."""
+        try:
+            from services.supabase_client import get_supabase_client
+            from services.world_state import refresh_world_state
+            db = get_supabase_client()
+            resp = await asyncio.to_thread(
+                lambda: db.client.table("users").select("id").eq("ai_enabled", True).execute()
+            )
+            user_ids = [r["id"] for r in (resp.data or [])]
+            for uid in user_ids:
+                try:
+                    await refresh_world_state(uid)
+                except Exception:
+                    pass
+            logger.debug(f"[Scheduler] World state refreshed for {len(user_ids)} users")
+        except Exception as e:
+            logger.error(f"[Scheduler] World state refresh failed: {e}", exc_info=True)
 
     def stop(self):
         """Stop the background scheduler."""

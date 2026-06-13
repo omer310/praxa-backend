@@ -4,7 +4,7 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from typing import Optional
 from uuid import UUID
 import json
@@ -46,7 +46,8 @@ from livekit.agents import (
     llm,
     function_tool,
 )
-from livekit.plugins import deepgram, elevenlabs, openai, silero
+from livekit.plugins import assemblyai, deepgram, elevenlabs, openai, silero
+from livekit.plugins.elevenlabs import VoiceSettings
 
 # LiveKit SIP configuration
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
@@ -368,7 +369,7 @@ class PraxaAgent:
 
     async def on_call_started(self):
         """Called when the call is connected."""
-        self.call_started_at = datetime.utcnow()
+        self.call_started_at = datetime.now(timezone.utc)
         
         # Update call log
         await self.db.update_call_log(self.call_log_id, {
@@ -384,7 +385,7 @@ class PraxaAgent:
             logger.info("In-app session ended — saving memory only")
             if self.transcript and self.user_id:
                 try:
-                    ended_at = datetime.utcnow()
+                    ended_at = datetime.now(timezone.utc)
                     duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
                     await extract_and_store_session_memory(
                         user_id=self.user_id,
@@ -406,7 +407,7 @@ class PraxaAgent:
             return
 
         try:
-            ended_at = datetime.utcnow()
+            ended_at = datetime.now(timezone.utc)
             duration = int((ended_at - self.call_started_at).total_seconds()) if self.call_started_at else 0
         
             transcript_count = len(self.transcript)
@@ -524,7 +525,7 @@ Transcript:
             
             openai_client = openai_api.OpenAI()
             response = openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": summary_prompt}],
                 max_tokens=200
             )
@@ -540,7 +541,7 @@ Transcript:
         transcript_entry = {
             "role": role,
             "content": content,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         self.transcript.append(transcript_entry)
         logger.info(f"[TRANSCRIPT DEBUG] Added to transcript - {role}: {content[:50]}... (total: {len(self.transcript)} messages)")
@@ -1294,20 +1295,26 @@ async def entrypoint(ctx: JobContext):
         vad = silero.VAD.load()
         logger.info("VAD loaded")
         
-        stt = deepgram.STT()
-        logger.info("Deepgram STT initialized")
+        stt = assemblyai.STT(model="u3-rt-pro", end_of_turn_confidence_threshold=0.4)
+        logger.info("AssemblyAI STT initialized (u3-rt-pro)")
         
         llm_instance = openai.LLM(model="gpt-4.1")
         logger.info("OpenAI LLM initialized")
         
         eleven_api_key = os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
-        eleven_voice_id = os.getenv("ELEVEN_LABS_VOICE_ID", "r5iFzIytiA1rzjhWFCjW")
+        eleven_voice_id = (praxa.user_settings or {}).get("tts_voice_id") or os.getenv("ELEVEN_LABS_VOICE_ID", "r5iFzIytiA1rzjhWFCjW")
         logger.info(f"ElevenLabs TTS: voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}")
         print(f"[TTS] ElevenLabs voice_id={eleven_voice_id}, api_key_set={bool(eleven_api_key)}", flush=True)
         tts = elevenlabs.TTS(
             api_key=eleven_api_key,
             voice_id=eleven_voice_id,
             model="eleven_flash_v2_5",
+            voice_settings=VoiceSettings(
+                stability=0.45,
+                similarity_boost=0.80,
+                style=0.0,
+                use_speaker_boost=True,
+            ),
         )
         logger.info("ElevenLabs TTS initialized")
         
@@ -1320,6 +1327,7 @@ async def entrypoint(ctx: JobContext):
             stt=stt,
             llm=llm_instance,
             tts=tts,
+            turn_detection="stt",
         )
         logger.info("AgentSession created successfully")
         
@@ -1532,14 +1540,13 @@ async def entrypoint(ctx: JobContext):
         print("=" * 60, flush=True)
         
         try:
-            # Try to get conversation history from session.history (LiveKit v1.0+ API)
+            # Try to get conversation history from session.history (LiveKit 1.6.0 API)
             if session is not None and hasattr(session, 'history'):
                 history = session.history
-                # ChatContext in LiveKit v1.0+ has a .messages attribute, not directly iterable
-                if hasattr(history, 'messages'):
-                    history_items = list(history.messages)
-                elif hasattr(history, 'items'):
-                    history_items = list(history.items)
+                # In LiveKit 1.6.0+, history.items is a @property returning list[ChatItem];
+                # history.messages is a method (not iterable) — only use .items.
+                if hasattr(history, 'items'):
+                    history_items = [i for i in history.items if getattr(i, 'type', None) == 'message']
                 else:
                     history_items = []
                 logger.info(f"[TRANSCRIPT FINAL] Found session.history with {len(history_items)} items")

@@ -10,7 +10,7 @@ import os
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID, uuid4
@@ -65,6 +65,9 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
+# Shared secret for internal service-to-service calls (background agent → trigger call)
+PRAXA_INTERNAL_SECRET = os.getenv("PRAXA_INTERNAL_SECRET", "")
+
 
 async def verify_jwt_token(request: Request) -> dict:
     """
@@ -105,7 +108,7 @@ async def verify_jwt_token(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-async def trigger_call_for_user(user_id: str) -> Optional[dict]:
+async def trigger_call_for_user(user_id: str, reason: Optional[str] = None) -> Optional[dict]:
     """
     Trigger a call for a specific user.
     
@@ -236,6 +239,8 @@ async def trigger_call_for_user(user_id: str) -> Optional[dict]:
                 metadata_dict["calendar_grant_id"] = calendar_grant_id
             if email_grant_id:
                 metadata_dict["email_grant_id"] = email_grant_id
+            if reason:
+                metadata_dict["reason"] = reason
             
             room_metadata = json.dumps(metadata_dict)
             
@@ -348,7 +353,7 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         environment=ENVIRONMENT,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
 
 
@@ -490,7 +495,7 @@ async def twilio_webhook(request: Request):
             if our_status in [CallStatus.COMPLETED, CallStatus.FAILED, 
                              CallStatus.NO_ANSWER, CallStatus.BUSY, 
                              CallStatus.CANCELED]:
-                updates["ended_at"] = datetime.utcnow().isoformat()
+                updates["ended_at"] = datetime.now(timezone.utc).isoformat()
             
             # Add failure reason for failed calls
             if our_status in [CallStatus.FAILED, CallStatus.NO_ANSWER, CallStatus.BUSY]:
@@ -559,26 +564,37 @@ async def twilio_webhook(request: Request):
 
 @app.post("/webhook/twilio/inbound-sms")
 @limiter.limit("60/minute")
-async def twilio_inbound_sms(request: Request):
+async def twilio_inbound_sms(request: Request, background_tasks: BackgroundTasks):
     """
-    Twilio Messaging webhook for inbound SMS replies.
+    Twilio Messaging webhook for inbound SMS replies (CANONICAL / PREFERRED PATH).
 
-    Twilio sends a POST with form fields when a user replies to one of our
-    outbound SMS notifications.  We look up the sender, run the AI reply
-    processor, and return TwiML so Twilio delivers our response back to them.
+    This is the full AI agent path using sms_agent.py + praxa_core tools.
+    It is more capable than the legacy Supabase edge function (twilio-inbound-sms),
+    which uses simple intent classification only.
 
-    Configure this URL in the Twilio console under the Messaging Service
-    (or phone number) → "A message comes in" webhook.
+    IMPORTANT — SMS routing audit note:
+    A legacy `twilio-inbound-sms` Supabase edge function also exists and is ACTIVE.
+    Only ONE endpoint can be configured in the Twilio console at a time.
+    To use this backend path (recommended):
+      1. Set the Twilio Messaging Service webhook URL to this backend's URL:
+         {BASE_URL}/webhook/twilio/inbound-sms
+      2. Disable or leave the Supabase edge function unconfigured in Twilio.
+    The edge function URL would be:
+      https://<project-ref>.supabase.co/functions/v1/twilio-inbound-sms
+
+    A tool-using, memory-loaded agent handles the reply, which exceeds Twilio's
+    synchronous webhook window. So we ack immediately with an empty TwiML and
+    process the message in a BackgroundTask; the agent sends its reply via
+    Twilio outbound REST (services/twilio_sms.send_sms).
     """
-    from services.reply_processor import lookup_user_by_phone, process_reply as _process_reply
+    from services.reply_processor import lookup_user_by_phone
+    from services.twilio_sms import send_sms
+    from services.sms_agent import handle_inbound
 
-    def _twiml(msg: str) -> Response:
-        safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        xml = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response><Message>{safe}</Message></Response>"
-        )
-        return Response(content=xml, media_type="application/xml")
+    _empty = Response(
+        content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+        media_type="application/xml",
+    )
 
     try:
         form = await request.form()
@@ -586,34 +602,206 @@ async def twilio_inbound_sms(request: Request):
         body: str = (form.get("Body") or "").strip()
 
         if not from_number or not body:
-            return Response(
-                content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-                media_type="application/xml",
-            )
+            return _empty
 
         logger.info(f"[InboundSMS] from={from_number} body_len={len(body)}")
 
         user_id = await lookup_user_by_phone(from_number)
         if not user_id:
             logger.warning(f"[InboundSMS] Unrecognized number: {from_number}")
-            return _twiml(
-                "We couldn't match your number to a Praxa account. "
-                "Open the app to manage your tasks."
+            background_tasks.add_task(
+                send_sms,
+                from_number,
+                "We couldn't match your number to a Praxa account. Open the app to manage your tasks.",
             )
+            return _empty
 
-        reply = await _process_reply(
-            user_id=user_id,
-            channel="sms",
-            raw_message=body,
-        )
-        return _twiml(reply)
+        background_tasks.add_task(handle_inbound, user_id, body, from_number)
+        return _empty
 
     except Exception as exc:
         logger.error(f"[InboundSMS] Unhandled error: {exc}")
-        return Response(
-            content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-            media_type="application/xml",
+        return _empty
+
+
+@app.post("/webhook/slack/events")
+@limiter.limit("120/minute")
+async def slack_events(request: Request, background_tasks: BackgroundTasks):
+    """Receives Slack events forwarded by the `slack-events` edge function.
+
+    The edge function verifies the Slack signature and forwards the raw event
+    JSON with the shared secret. We authenticate the secret, ack immediately,
+    and run the Slack agent in a BackgroundTask (it replies in-thread).
+    """
+    secret = os.getenv("PRAXA_WEBHOOK_SECRET")
+    if secret and request.headers.get("X-Praxa-Secret") != secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    from services.slack_agent import handle_event, enabled
+    if not enabled():
+        return JSONResponse({"ok": True})
+
+    background_tasks.add_task(handle_event, payload)
+    return JSONResponse({"ok": True})
+
+
+_NYLAS_EMAIL_EVENTS = {"message.created", "email.created", "message.updated"}
+_NYLAS_CALENDAR_EVENTS = {"event.created", "event.updated", "event.deleted"}
+
+
+def _verify_nylas_signature(request: Request, body_bytes: bytes) -> bool:
+    """Return True if the Nylas HMAC-SHA256 signature is valid (or secret not configured)."""
+    import hashlib
+    import hmac as _hmac
+    nylas_secret = os.getenv("NYLAS_WEBHOOK_SECRET", "")
+    if not nylas_secret:
+        return True
+    sig = request.headers.get("X-Nylas-Signature", "")
+    expected = _hmac.new(nylas_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(sig, expected)
+
+
+@app.post("/webhook/nylas/email")
+@limiter.limit("300/minute")
+async def nylas_email_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Nylas v3 unified webhook for email AND calendar events.
+
+    Configure a single Nylas webhook in the dashboard pointing at this URL with
+    the following triggers enabled:
+      Email:    message.created, message.updated
+      Calendar: event.created, event.updated, event.deleted
+
+    Set NYLAS_WEBHOOK_SECRET to the Nylas signing secret to enable HMAC
+    verification. Without it the endpoint accepts all POST requests (dev mode).
+
+    Email events: classified via email_classifier.py → email_insights table.
+    Calendar events: trigger world-state refresh for affected user.
+    """
+    body_bytes = await request.body()
+    if not _verify_nylas_signature(request, body_bytes):
+        raise HTTPException(status_code=403, detail="Invalid Nylas signature")
+    try:
+        payload = json.loads(body_bytes)
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    event_type = payload.get("type", "")
+    if event_type in _NYLAS_EMAIL_EVENTS:
+        background_tasks.add_task(_handle_nylas_email_event, payload)
+    elif event_type in _NYLAS_CALENDAR_EVENTS:
+        background_tasks.add_task(_handle_nylas_calendar_event, payload)
+    else:
+        logger.debug(f"[nylas_webhook] Unhandled event type '{event_type}' — ignoring")
+    return JSONResponse({"ok": True})
+
+
+async def _handle_nylas_email_event(payload: dict) -> None:
+    """Classify an inbound Nylas email event and notify the user if urgent."""
+    try:
+        event_type = payload.get("type", "")
+        if event_type not in ("message.created", "email.created"):
+            return
+
+        data = payload.get("data", {}).get("object", {})
+        grant_id = data.get("grant_id") or payload.get("grant_id")
+        if not grant_id:
+            return
+
+        db = get_supabase_client()
+        token_resp = await asyncio.to_thread(
+            lambda: db.client.table("nylas_oauth_tokens")
+            .select("user_id")
+            .eq("grant_id", grant_id)
+            .eq("integration_type", "email")
+            .maybe_single()
+            .execute()
         )
+        if not token_resp or not token_resp.data:
+            return
+        user_id = token_resp.data.get("user_id")
+        if not user_id:
+            return
+
+        email_id = data.get("id", "")
+        thread_id = data.get("thread_id")
+        subject = data.get("subject", "(no subject)")
+        from_list = data.get("from") or [{}]
+        sender_name = from_list[0].get("name") or from_list[0].get("email", "someone")
+        sender_email = from_list[0].get("email", "")
+        snippet = (data.get("snippet") or "")[:300]
+        received_at_raw = data.get("date")
+        received_at = (
+            datetime.utcfromtimestamp(received_at_raw).isoformat() if received_at_raw else None
+        )
+
+        from services.email_classifier import classify_and_store_email_insight
+        classification = await classify_and_store_email_insight(
+            user_id=user_id,
+            email_id=email_id,
+            thread_id=thread_id,
+            from_email=sender_email,
+            from_name=sender_name,
+            subject=subject,
+            snippet=snippet,
+            received_at=received_at,
+        )
+
+        if classification and classification.get("insight_type") == "needs_attention":
+            from services.notify_service import notify_user
+            await notify_user(
+                user_id=user_id,
+                event_type="urgent_email",
+                title=f"Email from {sender_name}",
+                body=f"Re: {subject[:80]}",
+                data={"route": "/email-mode", "grant_id": grant_id},
+            )
+            logger.info(f"[nylas_webhook] Classified and notified {user_id} for urgent email from {sender_name}")
+        else:
+            logger.debug(f"[nylas_webhook] Email from {sender_name} classified as no_action or awaiting_response; no push sent")
+    except Exception as e:
+        logger.error(f"[nylas_webhook] event handling failed: {e}", exc_info=True)
+
+
+async def _handle_nylas_calendar_event(payload: dict) -> None:
+    """Resolve the user from a Nylas calendar event and refresh their world state."""
+    try:
+        event_type = payload.get("type", "")
+        data = payload.get("data", {}).get("object", {})
+        grant_id = data.get("grant_id") or payload.get("grant_id")
+        if not grant_id:
+            return
+
+        db = get_supabase_client()
+        token_resp = await asyncio.to_thread(
+            lambda: db.client.table("nylas_oauth_tokens")
+            .select("user_id")
+            .eq("grant_id", grant_id)
+            .eq("integration_type", "calendar")
+            .maybe_single()
+            .execute()
+        )
+        if not token_resp or not token_resp.data:
+            return
+        user_id = token_resp.data.get("user_id")
+        if not user_id:
+            return
+
+        event_title = data.get("title", "(untitled)")
+        logger.info(f"[nylas_calendar] {event_type} for user={user_id}: '{event_title}'")
+
+        try:
+            from services.world_state import refresh_world_state
+            await refresh_world_state(user_id)
+        except ImportError:
+            pass
+
+    except Exception as e:
+        logger.error(f"[nylas_calendar] event handling failed: {e}", exc_info=True)
 
 
 @app.get("/scheduled-calls")
@@ -760,12 +948,12 @@ async def sync_scheduled_calls(
             # Cancel all pending calls if checkin is disabled or no schedule
             db.client.table("scheduled_calls").update({
                 "status": "cancelled",
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("user_id", user_id).eq("status", "pending").execute()
             
             hash_update = db.client.table("user_settings").update({
                 "checkin_schedule_hash": current_hash,
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("user_id", user_id).execute()
             if not hash_update.data:
                 logger.error(f"Failed to persist checkin_schedule_hash (disabled) for user {user_id}")
@@ -818,7 +1006,7 @@ async def sync_scheduled_calls(
         if ids_to_cancel:
             db.client.table("scheduled_calls").update({
                 "status": "cancelled",
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).in_("id", ids_to_cancel).execute()
             logger.info(f"Cancelled {len(ids_to_cancel)} removed slots for user {user_id}")
 
@@ -833,7 +1021,7 @@ async def sync_scheduled_calls(
         # Store new hash and log if it failed
         hash_update = db.client.table("user_settings").update({
             "checkin_schedule_hash": current_hash,
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("user_id", user_id).execute()
         if not hash_update.data:
             logger.error(f"Failed to persist checkin_schedule_hash for user {user_id} — idempotency check will not work next sync")
@@ -1009,6 +1197,177 @@ async def extract_skills(
     except Exception as e:
         logger.error(f"Error queuing skill extraction: {e}")
         raise HTTPException(status_code=500, detail="Failed to extract skills")
+
+
+class ActionOutcomeRequest(PydanticBase):
+    action_id: str
+    action_type: str
+    user_id: str
+    outcome: str
+    match_key: Optional[str] = None
+
+
+@app.post("/action-outcome")
+async def action_outcome(request_body: ActionOutcomeRequest, req: Request):
+    """Called by mobile after a user discards (or confirms) a pending action.
+
+    Inserts a row into action_approval_log so the autonomy learner can detect
+    patterns and eventually propose user_autonomy_rules.
+    """
+    if request_body.outcome not in ("confirmed", "discarded"):
+        raise HTTPException(status_code=422, detail="outcome must be 'confirmed' or 'discarded'")
+    try:
+        db = get_supabase_client()
+        await asyncio.to_thread(
+            lambda: db.client.table("action_approval_log").insert({
+                "user_id": request_body.user_id,
+                "action_type": request_body.action_type,
+                "match_key": request_body.match_key,
+                "outcome": request_body.outcome,
+            }).execute()
+        )
+        return {"status": "logged"}
+    except Exception as e:
+        logger.error(f"[action-outcome] Failed to log outcome: {e}")
+        raise HTTPException(status_code=500, detail="Failed to log outcome")
+
+
+class AutonomyRulePatchRequest(PydanticBase):
+    mode: str
+
+
+@app.patch("/autonomy-rules/{rule_id}")
+async def patch_autonomy_rule(rule_id: str, request_body: AutonomyRulePatchRequest, req: Request):
+    """Update the mode of a user_autonomy_rules row (proposed → auto, or auto → confirm)."""
+    if request_body.mode not in ("auto", "confirm", "proposed"):
+        raise HTTPException(status_code=422, detail="mode must be 'auto', 'confirm', or 'proposed'")
+    try:
+        db = get_supabase_client()
+        await asyncio.to_thread(
+            lambda: db.client.table("user_autonomy_rules")
+            .update({"mode": request_body.mode})
+            .eq("id", rule_id)
+            .execute()
+        )
+        return {"status": "updated", "rule_id": rule_id, "mode": request_body.mode}
+    except Exception as e:
+        logger.error(f"[autonomy-rules] patch failed for {rule_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update autonomy rule")
+
+
+@app.delete("/autonomy-rules/{rule_id}")
+async def delete_autonomy_rule(rule_id: str, req: Request):
+    """Delete a user_autonomy_rules row (user dismisses a proposed rule)."""
+    try:
+        db = get_supabase_client()
+        await asyncio.to_thread(
+            lambda: db.client.table("user_autonomy_rules").delete().eq("id", rule_id).execute()
+        )
+        return {"status": "deleted", "rule_id": rule_id}
+    except Exception as e:
+        logger.error(f"[autonomy-rules] delete failed for {rule_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete autonomy rule")
+
+
+class InternalTriggerCallRequest(PydanticBase):
+    user_id: str
+    reason: Optional[str] = None
+
+
+@app.post("/internal/trigger-call")
+async def internal_trigger_call(request_body: InternalTriggerCallRequest, req: Request):
+    """Internal endpoint for the background agent to trigger outbound calls without a user JWT."""
+    secret = req.headers.get("X-Internal-Secret", "")
+    if not PRAXA_INTERNAL_SECRET or secret != PRAXA_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    result = await trigger_call_for_user(request_body.user_id, reason=request_body.reason)
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to initiate call")
+    return {"status": "initiated", **result}
+
+
+class GenerateSessionBriefRequest(PydanticBase):
+    user_id: str
+    session_id: Optional[str] = None
+    transcript: list
+
+
+@app.post("/generate-session-brief")
+async def generate_session_brief(request_body: GenerateSessionBriefRequest, background_tasks: BackgroundTasks):
+    """Generate a structured post-call brief from a voice session transcript and push it to the user."""
+    background_tasks.add_task(_do_generate_session_brief, request_body)
+    return {"status": "queued"}
+
+
+async def _do_generate_session_brief(req: GenerateSessionBriefRequest):
+    try:
+        from openai import AsyncOpenAI
+
+        if len(req.transcript) < 2:
+            return
+
+        transcript_text = "\n".join(
+            f"{m['speaker'].title()}: {m['text']}" for m in req.transcript
+        )
+
+        openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Praxa, an AI executive assistant. "
+                        "Given a voice session transcript, produce a structured JSON brief. "
+                        'Respond ONLY with: {"key_points": [], "decisions": [], "action_items": [], "follow_ups": []}. '
+                        "Each list contains plain-text strings. Be concise."
+                    ),
+                },
+                {"role": "user", "content": f"Transcript:\n{transcript_text}"},
+            ],
+            max_tokens=600,
+            temperature=0.2,
+        )
+
+        import json as _json
+        brief = _json.loads(resp.choices[0].message.content or "{}")
+
+        db = get_supabase_client()
+        row = {
+            "user_id": req.user_id,
+            "brief": brief,
+        }
+        if req.session_id:
+            row["session_id"] = req.session_id
+
+        result = await asyncio.to_thread(
+            lambda: db.client.table("session_briefs").insert(row).execute()
+        )
+
+        brief_id = None
+        if result.data:
+            brief_id = result.data[0].get("id")
+
+        if brief_id:
+            push_token = await get_user_push_token(req.user_id)
+            if push_token:
+                action_items = brief.get("action_items", [])
+                summary_line = action_items[0] if action_items else "Your session summary is ready."
+                await send_push_notification(
+                    push_token=push_token,
+                    title="Session Brief Ready",
+                    body=summary_line[:120],
+                    data={
+                        "notificationType": "session_brief",
+                        "briefId": brief_id,
+                    },
+                )
+
+        logger.info(f"[session-brief] Brief generated for user {req.user_id}, id={brief_id}")
+    except Exception as e:
+        logger.error(f"[session-brief] Failed to generate brief: {e}")
 
 
 # ==================== Run Server ====================

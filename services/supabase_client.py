@@ -1,7 +1,7 @@
 """Supabase database client for all database operations."""
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 import logging
@@ -57,7 +57,7 @@ class SupabaseClient:
                 }).execute()
                 return True, 0, -1
 
-            window_start = (datetime.utcnow() - timedelta(days=self.VOICE_CALL_WINDOW_DAYS)).isoformat()
+            window_start = (datetime.now(timezone.utc) - timedelta(days=self.VOICE_CALL_WINDOW_DAYS)).isoformat()
             count_resp = self.client.table("function_rate_limits").select(
                 "id", count="exact"
             ).eq("user_id", user_id).eq("function_name", self.VOICE_FUNCTION_NAME).gte("called_at", window_start).execute()
@@ -204,7 +204,7 @@ class SupabaseClient:
             List of tasks past their due date that aren't done
         """
         try:
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
             
             response = self.client.table("loops").select(
                 "*, buckets(name, color)"
@@ -293,7 +293,7 @@ class SupabaseClient:
             List of recently completed tasks
         """
         try:
-            since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
             
             response = self.client.table("loops").select(
                 "*, buckets(name, color)"
@@ -328,7 +328,7 @@ class SupabaseClient:
         try:
             response = self.client.table("loops").update({
                 "status": "done",
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", loop_id).execute()
             
             logger.info(f"Marked task {loop_id} as complete")
@@ -353,7 +353,7 @@ class SupabaseClient:
             existing = self.client.table("loops").select("notes").eq("id", loop_id).single().execute()
             
             existing_notes = existing.data.get("notes", "") if existing.data else ""
-            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
             
             if existing_notes:
                 new_notes = f"{existing_notes}\n\n[{timestamp} - Praxa Call] {note}"
@@ -362,7 +362,7 @@ class SupabaseClient:
             
             response = self.client.table("loops").update({
                 "notes": new_notes,
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", loop_id).execute()
             
             logger.info(f"Added note to task {loop_id}")
@@ -404,8 +404,8 @@ class SupabaseClient:
                 "status": "open",
                 "priority": priority,
                 "is_this_week": is_this_week,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
             
             if description:
@@ -435,7 +435,7 @@ class SupabaseClient:
         try:
             response = self.client.table("loops").update({
                 "due_date": due_date,
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", loop_id).execute()
             
             logger.info(f"Updated due date for task {loop_id}")
@@ -458,7 +458,7 @@ class SupabaseClient:
         try:
             response = self.client.table("loops").update({
                 "status": status,
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", loop_id).execute()
             
             logger.info(f"Updated status for task {loop_id} to {status}")
@@ -480,7 +480,7 @@ class SupabaseClient:
             Updated task data
         """
         try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
             response = self.client.table("loops").update(updates).eq("id", loop_id).execute()
             logger.info(f"Updated loop {loop_id}: {list(updates.keys())}")
             return response.data[0] if response.data else {}
@@ -518,8 +518,8 @@ class SupabaseClient:
                 "color": color,
                 "icon": icon,
                 "archived": False,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             if description:
                 bucket_data["description"] = description
@@ -560,8 +560,8 @@ class SupabaseClient:
                 "phone_number": phone_number,
                 "livekit_room_name": livekit_room_name,
                 "status": "initiated",
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
             
             if scheduled_at:
@@ -587,7 +587,7 @@ class SupabaseClient:
             Updated call log data
         """
         try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
             
             response = self.client.table("call_logs").update(updates).eq("id", call_log_id).execute()
             
@@ -714,8 +714,8 @@ class SupabaseClient:
                     "status": "pending",
                     "attempt_count": 0,
                     "max_attempts": 3,
-                    "created_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }
                 
                 try:
@@ -739,7 +739,7 @@ class SupabaseClient:
                 try:
                     self.client.table("user_settings").update({
                         "next_scheduled_call": earliest["scheduled_for"],
-                        "updated_at": datetime.utcnow().isoformat()
+                        "updated_at": datetime.now(timezone.utc).isoformat()
                     }).eq("user_id", user_id).execute()
                 except Exception as e:
                     logger.warning(f"Could not update user_settings.next_scheduled_call: {e}")
@@ -804,7 +804,7 @@ class SupabaseClient:
             Updated scheduled call data
         """
         try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
             
             response = self.client.table("scheduled_calls").update(updates).eq("id", scheduled_call_id).execute()
             
@@ -1081,8 +1081,8 @@ class SupabaseClient:
                 "status": "pending",
                 "attempt_count": 0,
                 "max_attempts": 3,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
             
             response = self.client.table("scheduled_calls").insert(scheduled_call_data).execute()
@@ -1091,7 +1091,7 @@ class SupabaseClient:
             try:
                 self.client.table("user_settings").update({
                     "next_scheduled_call": next_call_utc.isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }).eq("user_id", user_id).execute()
             except Exception as e:
                 logger.warning(f"Could not update user_settings.next_scheduled_call: {e}")
@@ -1108,7 +1108,7 @@ class SupabaseClient:
     async def update_bucket(self, bucket_id: str, updates: dict) -> dict:
         """Update a bucket's properties (goal, description, etc.)."""
         try:
-            updates["updated_at"] = datetime.utcnow().isoformat()
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
             response = self.client.table("buckets").update(updates).eq("id", bucket_id).execute()
             return response.data[0] if response.data else {}
         except Exception as e:

@@ -85,7 +85,7 @@ Existing summary to refine (if provided): {summary[:500] if summary else 'None'}
 Return ONLY valid JSON, no markdown."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": extraction_prompt}],
             temperature=0.3,
             response_format={"type": "json_object"},
@@ -106,7 +106,7 @@ Return ONLY valid JSON, no markdown."""
             "summary": extracted_summary,
             "key_facts": facts,
             "duration_seconds": duration,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if session_id:
             summary_row["session_id"] = session_id
@@ -130,7 +130,7 @@ Return ONLY valid JSON, no markdown."""
                 "fact_value": value,
                 "source": surface,
                 "confidence": confidence,
-                "last_confirmed_at": datetime.utcnow().isoformat(),
+                "last_confirmed_at": datetime.now(timezone.utc).isoformat(),
             }
             if fact_embedding:
                 fact_row["embedding"] = fact_embedding
@@ -247,7 +247,19 @@ async def load_session_context(user_id: str, query_text: str | None = None) -> s
             )
             facts = facts_resp.data or []
 
-        if not core_profile_text and not facts and not recent_summaries and not compressed:
+        # --- SKILLS: active behavioral skills for this user ---
+        skills_resp = await asyncio.to_thread(
+            lambda: db.table("user_agent_skills")
+            .select("name, content, category")
+            .eq("user_id", user_id)
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        skills = skills_resp.data or []
+
+        if not core_profile_text and not facts and not recent_summaries and not compressed and not skills:
             return ""
 
         lines = ["## Memory Context\n"]
@@ -281,6 +293,13 @@ async def load_session_context(user_id: str, query_text: str | None = None) -> s
             lines.append("### Relevant past sessions")
             for s in archived_summaries:
                 lines.append(f"- [archived {s['created_at'][:10]}] {s['summary']}")
+            lines.append("")
+
+        if skills:
+            lines.append("## Agent Skills")
+            for skill in skills:
+                category_tag = f" [{skill['category']}]" if skill.get("category") else ""
+                lines.append(f"\n### {skill['name']}{category_tag}\n{skill['content']}")
             lines.append("")
 
         return "\n".join(lines)
@@ -335,7 +354,7 @@ Conversation:
 Return ONLY valid JSON."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": extraction_prompt}],
             temperature=0.3,
             response_format={"type": "json_object"},
@@ -362,7 +381,7 @@ Return ONLY valid JSON."""
 
             existing = db.table("user_agent_skills").select("source").eq(
                 "user_id", user_id
-            ).eq("slug", slug).eq("status", "active").maybeSingle().execute()
+            ).eq("slug", slug).eq("status", "active").maybe_single().execute()
             if existing.data and existing.data.get("source") == "manual":
                 continue
 
@@ -473,7 +492,7 @@ Facts:
 Return ONLY valid JSON."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": consolidation_prompt}],
             temperature=0.2,
             response_format={"type": "json_object"},
@@ -603,7 +622,7 @@ Session history to compress:
 Return only the compressed paragraph, no headers or labels."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": compression_prompt}],
             temperature=0.3,
         )
@@ -698,7 +717,7 @@ Source material:
 Return only the profile paragraph, no headers, labels, or preamble."""
 
         response = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": profile_prompt}],
             temperature=0.3,
         )

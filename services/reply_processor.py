@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from openai import AsyncOpenAI
@@ -78,7 +78,7 @@ async def _fetch_user_context(user_id: str) -> dict:
 
         settings_resp = db.client.table("user_settings").select(
             "timezone, sprint_cadence, notification_preferences"
-        ).eq("user_id", user_id).maybeSingle().execute()
+        ).eq("user_id", user_id).maybe_single().execute()
         settings: dict = settings_resp.data or {}
 
         log_resp = db.client.table("notification_log").select(
@@ -182,7 +182,7 @@ async def _validate_context(
                 done_resp = db.client.table("loops").select(
                     "title, status"
                 ).eq("user_id", user_id).in_(
-                    "status", ["completed"]
+                    "status", ["done"]
                 ).limit(30).execute()
                 completed_tasks: list[dict] = done_resp.data or []
                 hl = hint.lower()
@@ -295,7 +295,7 @@ async def _parse_intent(message: str, user_context: dict, channel: str) -> dict:
     )
     try:
         resp = await openai.chat.completions.create(
-            model="gpt-5.4-mini",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": message},
@@ -340,13 +340,13 @@ def _append_task_note(user_id: str, task_id: str, note: str, source: str) -> Non
     ).eq("user_id", user_id).single().execute()
 
     existing_notes = existing.data.get("notes", "") if existing.data else ""
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     note_line = f"[{timestamp} - Praxa {source}] {note}"
     new_notes = f"{existing_notes}\n\n{note_line}" if existing_notes else note_line
 
     db.client.table("loops").update({
         "notes": new_notes,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", task_id).eq("user_id", user_id).execute()
 
 
@@ -379,7 +379,7 @@ async def _execute(
             if not task:
                 return "task_not_found", {"hint": hint}, None
             db.client.table("loops").update(
-                {"status": "completed", "updated_at": datetime.utcnow().isoformat()}
+                {"status": "done", "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("id", task["id"]).eq("user_id", user_id).execute()
             return "task_completed", {"task_id": task["id"], "title": task["title"]}, None
 
@@ -406,7 +406,7 @@ async def _execute(
             if not task or not new_due:
                 return "snooze_failed", {"hint": hint, "new_due_date": new_due}, None
             db.client.table("loops").update(
-                {"due_date": new_due, "updated_at": datetime.utcnow().isoformat()}
+                {"due_date": new_due, "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("id", task["id"]).eq("user_id", user_id).execute()
             return "task_snoozed", {
                 "task_id": task["id"],
@@ -423,8 +423,8 @@ async def _execute(
                 "title": title,
                 "status": "open",
                 "archived": False,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             if params.get("due_date"):
                 new_row["due_date"] = params["due_date"]
@@ -437,7 +437,7 @@ async def _execute(
             if not call:
                 return "no_call_found", {}, None
             db.client.table("scheduled_calls").update(
-                {"status": "cancelled", "updated_at": datetime.utcnow().isoformat()}
+                {"status": "cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("id", call["id"]).execute()
             return "call_cancelled", {"call_id": call["id"]}, None
 
@@ -478,7 +478,7 @@ async def _log_reply(
             "action_taken": action_taken,
             "action_result": action_result,
             "reply_sent": reply_sent,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
             "error": error,
         }).execute()
     except Exception as exc:
