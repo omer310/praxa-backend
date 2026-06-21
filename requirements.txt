@@ -21,6 +21,7 @@ supabase>=2.0.0
 fastapi>=0.115.0,<1.0.0
 uvicorn>=0.32.0
 slowapi>=0.1.9  # Rate limiting
+python-multipart>=0.0.9  # Required by FastAPI to parse Twilio's form-encoded webhooks
 
 # Background tasks
 apscheduler>=3.10.0
