@@ -853,8 +853,8 @@ class SupabaseClient:
                     "status": "pending",
                     "attempt_count": 0,
                     "max_attempts": 3,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat()
+                    "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                    "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
                 }
                 
                 try:
@@ -878,7 +878,7 @@ class SupabaseClient:
                 try:
                     self.client.table("user_settings").update({
                         "next_scheduled_call": earliest["scheduled_for"],
-                        "updated_at": datetime.now(timezone.utc).isoformat()
+                        "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
                     }).eq("user_id", user_id).execute()
                 except Exception as e:
                     logger.warning(f"Could not update user_settings.next_scheduled_call: {e}")
