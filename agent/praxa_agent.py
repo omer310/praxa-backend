@@ -41,7 +41,10 @@ from livekit.agents import (
     AgentSession,
     AutoSubscribe,
     JobContext,
+    JobProcess,
     WorkerOptions,
+    TurnHandlingOptions,
+    inference,
     cli,
     llm,
     function_tool,
@@ -925,6 +928,79 @@ Transcript:
             logger.error(f"Error updating loop: {e}")
             return "Sorry, I had trouble updating that task."
 
+    async def break_down_task(self, task_title: str, subtasks: list[str]) -> str:
+        """Break a task into subtasks. Only call after the user agrees to the breakdown."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+
+            clean = [t.strip() for t in (subtasks or []) if t and t.strip()]
+            if not clean:
+                return "Tell me the steps you'd like and I'll add them."
+
+            created = await self.db.add_subtasks(task["id"], self.user_id, clean, created_by="agent")
+            self.tasks_discussed.append(task["id"])
+            logger.info(f"Broke down task '{task_title}' into {len(created)} subtasks")
+            return f"Done — I broke '{task['title']}' into {len(clean)} steps: " + "; ".join(clean)
+        except Exception as e:
+            logger.error(f"Error breaking down task: {e}")
+            return "Sorry, I had trouble breaking that task down."
+
+    async def add_subtask(self, task_title: str, subtask_title: str) -> str:
+        """Add a single subtask to a task."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+            if not subtask_title or not subtask_title.strip():
+                return "What should the step be?"
+
+            await self.db.add_subtask(task["id"], self.user_id, subtask_title.strip(), created_by="agent")
+            self.tasks_discussed.append(task["id"])
+            return f"Added '{subtask_title.strip()}' to '{task['title']}'."
+        except Exception as e:
+            logger.error(f"Error adding subtask: {e}")
+            return "Sorry, I had trouble adding that step."
+
+    async def complete_subtask(self, task_title: str, subtask_title: str) -> str:
+        """Mark a subtask done by partial title within a task."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+
+            subtasks = await self.db.list_subtasks(task["id"])
+            needle = subtask_title.lower().strip()
+            match = next((s for s in subtasks if needle in s["title"].lower()), None)
+            if not match:
+                return f"I couldn't find a step matching '{subtask_title}' on '{task['title']}'."
+
+            await self.db.toggle_subtask(match["id"], done=True)
+            self.tasks_discussed.append(task["id"])
+            return f"Checked off '{match['title']}' on '{task['title']}'."
+        except Exception as e:
+            logger.error(f"Error completing subtask: {e}")
+            return "Sorry, I had trouble checking off that step."
+
+    async def list_subtasks(self, task_title: str) -> str:
+        """List a task's subtasks and how many are done."""
+        try:
+            task = self._find_task_by_title(task_title)
+            if not task:
+                return f"I couldn't find a task called '{task_title}'."
+
+            subtasks = await self.db.list_subtasks(task["id"])
+            if not subtasks:
+                return f"'{task['title']}' doesn't have any steps yet. Want me to break it down?"
+
+            done = sum(1 for s in subtasks if s.get("done"))
+            titles = ", ".join(s["title"] for s in subtasks)
+            return f"'{task['title']}' has {done} of {len(subtasks)} steps done: {titles}."
+        except Exception as e:
+            logger.error(f"Error listing subtasks: {e}")
+            return "Sorry, I had trouble fetching those steps."
+
     async def schedule_loop(self, task_title: str, scheduled_time: str) -> str:
         """Set a specific scheduled time for a loop/task."""
         try:
@@ -1158,6 +1234,46 @@ def create_praxa_agent_class(praxa: PraxaAgent):
             return await praxa.schedule_loop(task_title, scheduled_time)
 
         @function_tool
+        async def break_down_task(self, task_title: str, subtasks: list[str]) -> str:
+            """Break a task into smaller subtasks. This is user-driven: only call it AFTER you've
+            suggested a breakdown out loud and the user agreed. Never restructure tasks silently.
+
+            Args:
+                task_title: The task to break down
+                subtasks: The ordered list of step titles the user agreed to
+            """
+            return await praxa.break_down_task(task_title, subtasks)
+
+        @function_tool
+        async def add_subtask(self, task_title: str, subtask_title: str) -> str:
+            """Add a single subtask (step) to an existing task.
+
+            Args:
+                task_title: The task to add a step to
+                subtask_title: The step to add
+            """
+            return await praxa.add_subtask(task_title, subtask_title)
+
+        @function_tool
+        async def complete_subtask(self, task_title: str, subtask_title: str) -> str:
+            """Mark a subtask (step) as done.
+
+            Args:
+                task_title: The task the step belongs to
+                subtask_title: The step to check off (partial match)
+            """
+            return await praxa.complete_subtask(task_title, subtask_title)
+
+        @function_tool
+        async def list_subtasks(self, task_title: str) -> str:
+            """List the subtasks (steps) of a task and how many are done.
+
+            Args:
+                task_title: The task to list steps for
+            """
+            return await praxa.list_subtasks(task_title)
+
+        @function_tool
         async def check_email(self) -> str:
             """Check the user's recent emails for anything important. Use when user asks about emails, or proactively at call start if email is connected."""
             return await praxa.check_email()
@@ -1292,13 +1408,13 @@ async def entrypoint(ctx: JobContext):
     try:
         logger.info("Initializing voice pipeline components...")
         
-        vad = silero.VAD.load()
+        vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
         logger.info("VAD loaded")
         
-        stt = assemblyai.STT(model="u3-rt-pro", end_of_turn_confidence_threshold=0.4)
+        stt = assemblyai.STT(model="u3-rt-pro")
         logger.info("AssemblyAI STT initialized (u3-rt-pro)")
         
-        llm_instance = openai.LLM(model="gpt-4.1")
+        llm_instance = openai.LLM(model="gpt-4o")
         logger.info("OpenAI LLM initialized")
         
         eleven_api_key = os.getenv("ELEVEN_LABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
@@ -1327,7 +1443,9 @@ async def entrypoint(ctx: JobContext):
             stt=stt,
             llm=llm_instance,
             tts=tts,
-            turn_detection="stt",
+            turn_handling=TurnHandlingOptions(
+                turn_detection=inference.TurnDetector(),
+            ),
         )
         logger.info("AgentSession created successfully")
         
@@ -1601,11 +1719,16 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"Error in on_call_ended: {e}")
 
 
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+
+
 def run_agent():
     """Run the LiveKit agent worker."""
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
         )
     )
 

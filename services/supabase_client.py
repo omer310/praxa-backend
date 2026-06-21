@@ -156,7 +156,7 @@ class SupabaseClient:
         """
         try:
             response = self.client.table("buckets").select(
-                "*, loops(*)"
+                "*, loops(*, subtasks(*))"
             ).eq("user_id", user_id).eq("archived", False).execute()
             
             return response.data or []
@@ -486,6 +486,145 @@ class SupabaseClient:
             return response.data[0] if response.data else {}
         except Exception as e:
             logger.error(f"Error updating loop: {e}")
+            raise
+
+    # ==================== Subtasks ====================
+
+    async def list_subtasks(self, loop_id: str) -> list[dict]:
+        """Return all subtasks for a loop, ordered by position."""
+        try:
+            response = (
+                self.client.table("subtasks")
+                .select("*")
+                .eq("loop_id", loop_id)
+                .order("position")
+                .order("created_at")
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error listing subtasks for loop {loop_id}: {e}")
+            raise
+
+    async def _next_subtask_position(self, loop_id: str) -> int:
+        """Compute the next position value to append a subtask to the end."""
+        existing = await self.list_subtasks(loop_id)
+        if not existing:
+            return 0
+        return max((s.get("position", 0) for s in existing), default=-1) + 1
+
+    async def add_subtask(
+        self,
+        loop_id: str,
+        user_id: str,
+        title: str,
+        created_by: str = "agent",
+        position: Optional[int] = None,
+    ) -> dict:
+        """Create a single subtask under a loop."""
+        try:
+            if position is None:
+                position = await self._next_subtask_position(loop_id)
+
+            now = datetime.now(timezone.utc).isoformat()
+            payload = {
+                "loop_id": loop_id,
+                "user_id": user_id,
+                "title": title.strip(),
+                "done": False,
+                "position": position,
+                "created_by": created_by if created_by in ("user", "agent") else "agent",
+                "created_at": now,
+                "updated_at": now,
+            }
+            response = self.client.table("subtasks").insert(payload).execute()
+            logger.info(f"Added subtask to loop {loop_id}: {title!r}")
+            return response.data[0] if response.data else {}
+        except Exception as e:
+            logger.error(f"Error adding subtask: {e}")
+            raise
+
+    async def add_subtasks(
+        self,
+        loop_id: str,
+        user_id: str,
+        titles: list[str],
+        created_by: str = "agent",
+    ) -> list[dict]:
+        """Bulk-create subtasks (used when breaking a task down)."""
+        try:
+            clean_titles = [t.strip() for t in titles if t and t.strip()]
+            if not clean_titles:
+                return []
+
+            start = await self._next_subtask_position(loop_id)
+            now = datetime.now(timezone.utc).isoformat()
+            safe_created_by = created_by if created_by in ("user", "agent") else "agent"
+            rows = [
+                {
+                    "loop_id": loop_id,
+                    "user_id": user_id,
+                    "title": title,
+                    "done": False,
+                    "position": start + i,
+                    "created_by": safe_created_by,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for i, title in enumerate(clean_titles)
+            ]
+            response = self.client.table("subtasks").insert(rows).execute()
+            logger.info(f"Added {len(rows)} subtasks to loop {loop_id}")
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error adding subtasks: {e}")
+            raise
+
+    async def toggle_subtask(self, subtask_id: str, done: Optional[bool] = None) -> dict:
+        """Set or flip a subtask's done state, tracking completed_at."""
+        try:
+            if done is None:
+                current = (
+                    self.client.table("subtasks")
+                    .select("done")
+                    .eq("id", subtask_id)
+                    .single()
+                    .execute()
+                )
+                done = not (current.data.get("done", False) if current.data else False)
+
+            updates = {
+                "done": done,
+                "completed_at": datetime.now(timezone.utc).isoformat() if done else None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            response = self.client.table("subtasks").update(updates).eq("id", subtask_id).execute()
+            logger.info(f"Toggled subtask {subtask_id} -> done={done}")
+            return response.data[0] if response.data else {}
+        except Exception as e:
+            logger.error(f"Error toggling subtask: {e}")
+            raise
+
+    async def delete_subtask(self, subtask_id: str) -> None:
+        """Delete a subtask."""
+        try:
+            self.client.table("subtasks").delete().eq("id", subtask_id).execute()
+            logger.info(f"Deleted subtask {subtask_id}")
+        except Exception as e:
+            logger.error(f"Error deleting subtask: {e}")
+            raise
+
+    async def reorder_subtasks(self, ordered_ids: list[str]) -> None:
+        """Persist a new ordering of subtasks by their id sequence."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            for position, subtask_id in enumerate(ordered_ids):
+                self.client.table("subtasks").update(
+                    {"position": position, "updated_at": now}
+                ).eq("id", subtask_id).execute()
+            logger.info(f"Reordered {len(ordered_ids)} subtasks")
+        except Exception as e:
+            logger.error(f"Error reordering subtasks: {e}")
             raise
 
     async def create_bucket(

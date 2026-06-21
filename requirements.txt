@@ -1,7 +1,8 @@
 # python >=3.10
 
-# LiveKit Agents Framework — all plugins must be on the same version
-livekit~=1.1.10
+# LiveKit Agents Framework — all plugins must be on the same version.
+# Pin livekit to match livekit-agents 1.6.0 (which requires livekit==1.1.8).
+livekit==1.1.8
 livekit-api~=1.1.0
 livekit-agents~=1.6.0
 livekit-plugins-assemblyai~=1.6.0
@@ -37,4 +38,4 @@ python-dateutil>=2.8.0
 # Single source of truth: https://github.com/omer310/praxa-core (pinned to a tag).
 # After publishing a new praxa_core release, bump the tag below in both backends.
 # Local dev alternative: pip install -e ../praxa_core
-praxa_core @ git+https://github.com/omer310/praxa-core.git@v0.2.0
+praxa_core @ git+https://github.com/omer310/praxa-core.git@v0.3.0

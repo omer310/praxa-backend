@@ -121,6 +121,23 @@ class Bucket(BaseModel):
         from_attributes = True
 
 
+class Subtask(BaseModel):
+    """A single step within a task (loop)."""
+    id: UUID
+    loop_id: UUID
+    user_id: UUID
+    title: str
+    done: bool = False
+    position: int = 0
+    created_by: str = "user"  # "user" or "agent"
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class Loop(BaseModel):
     """A task within a bucket."""
     id: UUID
@@ -138,6 +155,8 @@ class Loop(BaseModel):
     # Nested bucket name when fetched with joins
     bucket_name: Optional[str] = None
     bucket_color: Optional[str] = None
+    # Nested subtasks when fetched with joins
+    subtasks: list["Subtask"] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
